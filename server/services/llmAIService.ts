@@ -99,7 +99,7 @@ function limitArray(values: string[], max = 8): string[] {
 }
 
 /* ============================================================
-   VALIDATE / NORMALIZE GEMINI ANALYSIS
+   NORMALIZE GEMINI ANALYSIS
    ============================================================ */
 
 function normalizeAnalysis(
@@ -195,7 +195,7 @@ function normalizeAnalysis(
 
   const summary = cleanString(
     explanationRaw.summary,
-    `The analysis is based on the journal entry provided by the user.`
+    'The analysis is based on the journal entry provided by the user.'
   );
 
   const explanation = {
@@ -237,12 +237,6 @@ function normalizeAnalysis(
     8
   );
 
-  /*
-   * Important anti-hallucination guard:
-   *
-   * If Gemini says there are no explicit mentions, do not allow
-   * the UI to accidentally display generic invented information.
-   */
   const safeRawText = rawText.trim();
 
   if (!safeRawText) {
@@ -321,7 +315,11 @@ Sentence count:
 ${sentences.length}
 
 Detected sentences:
-${sentences.length > 0 ? sentences.map((s, i) => `${i + 1}. ${s}`).join('\n') : 'None'}
+${
+  sentences.length > 0
+    ? sentences.map((s, i) => `${i + 1}. ${s}`).join('\n')
+    : 'None'
+}
 
 ============================================================
 ANALYSIS RULES
@@ -426,17 +424,6 @@ Possible contexts include:
 
 If a context is not supported by the journal, DO NOT include it.
 
-For example:
-
-If the journal says:
-"I went shopping with my friends and had fun."
-
-Allowed:
-["Friends", "Social activities"]
-
-Not allowed:
-["Sleep", "Studies", "Deadlines"]
-
 7. TRIGGERS
 
 Only identify triggers that the user actually describes.
@@ -469,35 +456,11 @@ A. explicitMentions
 
 Things the user actually stated.
 
-Example journal:
-"I was nervous about my presentation tomorrow."
-
-Good:
-[
-  "The user mentioned feeling nervous.",
-  "The user mentioned a presentation tomorrow."
-]
-
-Bad:
-[
-  "The user has poor sleep.",
-  "The user is under academic pressure."
-]
-
-unless those things were actually stated.
-
 B. aiInferences
 
 Reasonable interpretations derived from the text.
 
 These MUST be labeled as interpretations, not facts.
-
-Example:
-[
-  "The upcoming presentation may be contributing to the nervousness."
-]
-
-Do not make strong claims that cannot be supported.
 
 C. bulletPoints
 
@@ -507,11 +470,7 @@ Give concise evidence-based points explaining the analysis.
 
 The summary should describe what the journal communicates.
 
-Do not use generic filler such as:
-
-"Your journal reflects a calm, steady rhythm today."
-
-unless the actual journal supports that interpretation.
+Do not use generic filler unless the actual journal supports that interpretation.
 
 11. AI RESPONSE
 
@@ -523,8 +482,6 @@ Do not give the same wellness message for every journal.
 
 Ask one natural question that is relevant to the journal.
 
-It must NOT be a generic question unrelated to the entry.
-
 13. CONTRIBUTING FACTORS
 
 Only list factors supported by the journal.
@@ -533,19 +490,7 @@ Only list factors supported by the journal.
 
 Suggestions must be relevant to the journal.
 
-Do not automatically recommend:
-
-- sleep
-- mindfulness
-- exercise
-
-unless they make sense for the actual situation.
-
-If the user is happy, suggestions can focus on maintaining or building on the positive experience.
-
-If the user is stressed about a project, suggestions can focus on breaking the project into manageable steps.
-
-If the user describes social conflict, suggestions can focus on communication or taking space.
+Do not automatically recommend sleep, mindfulness, or exercise unless they make sense for the actual situation.
 
 15. SAFETY
 
@@ -565,14 +510,7 @@ and provide a calm, supportive safety message and appropriate emergency/crisis r
 
 16. NO DIAGNOSIS
 
-Never diagnose:
-
-- depression
-- anxiety disorder
-- PTSD
-- bipolar disorder
-- ADHD
-- any other mental-health condition
+Never diagnose depression, anxiety disorder, PTSD, bipolar disorder, ADHD, or any other mental-health condition.
 
 You may describe emotions and observable language patterns.
 
@@ -590,8 +528,6 @@ ${lang}
 Confidence should represent how strongly the actual journal supports the interpretation.
 
 Short or ambiguous journals should have lower confidence.
-
-Do not automatically use 0.88.
 
 19. IMPORTANT SHORT-ENTRY RULE
 
@@ -645,12 +581,18 @@ export async function runLLMAnalysis(
     lang
   );
 
+  /*
+   * Journal analysis model.
+   *
+   * This can be configured separately from the chatbot.
+   */
   const model =
     process.env.GEMINI_MODEL?.trim() ||
-    'gemini-3.8-flash';
+    'gemini-3.5-flash-lite';
 
   const responseSchema = {
     type: Type.OBJECT,
+
     properties: {
       mood: {
         type: Type.STRING,
@@ -711,6 +653,7 @@ export async function runLLMAnalysis(
 
       explanation: {
         type: Type.OBJECT,
+
         properties: {
           summary: {
             type: Type.STRING
@@ -720,18 +663,14 @@ export async function runLLMAnalysis(
             type: Type.ARRAY,
             items: {
               type: Type.STRING
-            },
-            description:
-              'Only things explicitly stated in the journal.'
+            }
           },
 
           aiInferences: {
             type: Type.ARRAY,
             items: {
               type: Type.STRING
-            },
-            description:
-              'Reasonable interpretations clearly presented as inferences.'
+            }
           },
 
           bulletPoints: {
@@ -771,8 +710,10 @@ export async function runLLMAnalysis(
 
       suggestions: {
         type: Type.ARRAY,
+
         items: {
           type: Type.OBJECT,
+
           properties: {
             title: {
               type: Type.STRING
@@ -797,6 +738,7 @@ export async function runLLMAnalysis(
 
       safetyCheck: {
         type: Type.OBJECT,
+
         properties: {
           isCrisisDetected: {
             type: Type.BOOLEAN
@@ -838,27 +780,27 @@ export async function runLLMAnalysis(
     ]
   };
 
-  /*
-   * Gemini occasionally returns 503/429 when the service is busy.
-   * Retry temporary failures instead of replacing the result with
-   * fake/mock analysis.
-   */
   const maxAttempts = 3;
 
   let lastError: unknown = null;
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+  for (
+    let attempt = 1;
+    attempt <= maxAttempts;
+    attempt++
+  ) {
     try {
       console.log(
         `🧠 Gemini journal analysis attempt ${attempt}/${maxAttempts}`
       );
 
-      const apiCall = client.models.generateContent({
-        model,
-        contents: prompt,
+      const apiCall =
+        client.models.generateContent({
+          model,
+          contents: prompt,
 
-        config: {
-          systemInstruction: `
+          config: {
+            systemInstruction: `
 You are the analysis engine for Mood Journal AI.
 
 Your highest priority is factual grounding in the user's exact journal.
@@ -876,28 +818,31 @@ Do not diagnose medical or mental-health conditions.
 Return only the requested JSON structure.
 `,
 
-          responseMimeType: 'application/json',
+            responseMimeType: 'application/json',
 
-          responseSchema
+            responseSchema
+          }
+        });
+
+      const timeout = new Promise<never>(
+        (_, reject) => {
+          setTimeout(
+            () =>
+              reject(
+                new Error(
+                  'Gemini journal analysis timed out after 30000ms.'
+                )
+              ),
+            30000
+          );
         }
-      });
+      );
 
-      const timeout = new Promise<never>((_, reject) => {
-        setTimeout(
-          () =>
-            reject(
-              new Error(
-                'Gemini journal analysis timed out after 30000ms.'
-              )
-            ),
-          30000
-        );
-      });
-
-      const response: any = await Promise.race([
-        apiCall,
-        timeout
-      ]);
+      const response: any =
+        await Promise.race([
+          apiCall,
+          timeout
+        ]);
 
       const parsedText =
         response?.text?.trim();
@@ -923,11 +868,12 @@ Return only the requested JSON structure.
         );
       }
 
-      const normalized = normalizeAnalysis(
-        parsed,
-        journalText,
-        lang
-      );
+      const normalized =
+        normalizeAnalysis(
+          parsed,
+          journalText,
+          lang
+        );
 
       console.log(
         `✅ Gemini journal analysis completed successfully. Mood: ${normalized.mood}, Emotion: ${normalized.emotion}, Score: ${normalized.moodScore}`
@@ -988,14 +934,6 @@ Return only the requested JSON structure.
     }
   }
 
-  /*
-   * IMPORTANT:
-   *
-   * We deliberately DO NOT call runMockAnalysis here.
-   *
-   * Returning fake analysis is worse than showing the user
-   * that Gemini could not analyze the entry.
-   */
   throw new Error(
     `Gemini journal analysis failed after ${maxAttempts} attempts: ${
       lastError instanceof Error
@@ -1031,6 +969,12 @@ export async function runChatbotResponse(
   const language =
     languageNames[lang] || 'English';
 
+  /*
+   * Keep a useful amount of conversation history.
+   *
+   * We intentionally do not send unlimited history because
+   * that can make the chatbot slower and unnecessarily large.
+   */
   const recentHistory = history
     .filter(
       (item) =>
@@ -1053,62 +997,214 @@ export async function runChatbotResponse(
     latestJournalSummary?.trim() ||
     'No saved journal summary is available.';
 
+  /*
+   * IMPORTANT:
+   *
+   * The chatbot has its own instruction set.
+   *
+   * This is what makes it behave like a conversational assistant
+   * instead of simply returning a journal-analysis result.
+   */
   const systemInstruction = `
 You are the conversational AI assistant inside Mood Journal AI.
 
 You are powered by Gemini.
 
-LANGUAGE:
+============================================================
+LANGUAGE
+============================================================
+
 Always answer in ${language}.
 
-CONVERSATION:
-Use the complete recent conversation to understand the current message.
+If the user uses mixed language or natural Tanglish,
+understand the meaning and respond naturally in the same
+comfortable language style when appropriate.
 
-If the user says:
-- "yes"
-- "yeah"
-- "no"
-- "because..."
-- "what about that?"
-- "same"
-- "then..."
-- "why?"
+============================================================
+CONVERSATION MEMORY
+============================================================
 
-connect it to the previous conversation instead of treating it as an unrelated new conversation.
+Use the complete recent conversation to understand the
+current message.
 
-Do not ask the user to repeat information already provided.
+The conversation may contain short replies such as:
+
+- yes
+- yeah
+- no
+- because...
+- same
+- okay
+- then?
+- why?
+- what about that?
+- tell me more
+- I don't know
+
+These must be understood using the previous conversation.
+
+Do NOT treat every message as a completely new conversation.
+
+Do NOT ask the user to repeat information that already exists
+in the conversation.
+
+============================================================
+PERSONAL INFORMATION
+============================================================
 
 Do not invent personal information.
 
-Do not claim that you know something about the user unless it is present in the conversation or journal context.
+Only use personal information that appears in:
 
-JOURNAL CONTEXT:
+1. The current conversation
+2. The recent conversation history
+3. The provided journal context
+
+Do not claim to remember something that was never provided.
+
+============================================================
+LATEST JOURNAL CONTEXT
+============================================================
+
 ${journalContext}
 
-WELLNESS:
-You can support reflection and general wellness.
+Use this context when it is relevant.
+
+Do NOT force every conversation back to the journal.
+
+If the user asks something unrelated, answer that question
+normally.
+
+============================================================
+CONVERSATIONAL BEHAVIOR
+============================================================
+
+Have a natural human-like conversation.
+
+For example:
+
+User:
+"I completed my project today."
+
+Good response:
+"That's a nice achievement. You put in the work and got it
+done. How are you feeling now that it's finally finished?"
+
+If the user says:
+"very happy"
+
+Continue from the previous conversation.
+
+Do NOT restart the conversation by saying:
+"Thank you for sharing."
+
+Do NOT repeat the same generic wellness message.
+
+If the user says:
+"because I worked on it for three weeks"
+
+Recognize that this explains why finishing the project feels
+important.
+
+============================================================
+EMOTIONAL SUPPORT
+============================================================
+
+Be warm, respectful, supportive, and non-judgmental.
+
+You may help the user:
+
+- reflect on feelings
+- understand everyday emotions
+- organize thoughts
+- think through normal problems
+- identify practical next steps
+- celebrate positive experiences
+- talk through stress
+- talk through relationships
+- think about studies
+- think about projects
+- think about daily routines
 
 Do not diagnose mental-health or medical conditions.
 
-If the user appears to be in immediate danger or discusses self-harm, encourage appropriate real-world emergency or crisis support.
+Do not claim certainty about someone's mental state.
 
-STYLE:
+============================================================
+CRISIS SAFETY
+============================================================
+
+If the user clearly describes immediate danger,
+self-harm, suicide, or an emergency:
+
+- respond calmly
+- encourage immediate real-world support
+- encourage contacting local emergency services or a trusted
+  person nearby
+- do not provide dangerous instructions
+- do not diagnose
+
+For ordinary sadness, stress, frustration, loneliness,
+confusion, or disappointment, provide normal supportive
+conversation without unnecessarily escalating.
+
+============================================================
+STYLE
+============================================================
+
+Be:
+
 - Warm
 - Natural
-- Specific
 - Human-sounding
+- Specific
 - Concise
-- Usually 2–5 sentences
-- Answer the user's actual question first
-- Ask at most one useful follow-up question
-- Do not repeatedly use scripted phrases
-- Do not say "as an AI" unless necessary
+- Conversational
+- Helpful
 
-IMPORTANT:
-Do not force every conversation back to journaling.
-If the user asks a normal question, answer it normally.
+Usually respond in 2–5 sentences.
+
+Answer the user's actual question first.
+
+Ask at most ONE useful follow-up question when it naturally
+continues the conversation.
+
+Do not ask a question every single time.
+
+Do not repeatedly use scripted phrases such as:
+
+"Thank you for sharing."
+
+"I'm here for you."
+
+"That sounds difficult."
+
+Use those only when they genuinely fit.
+
+Do not say "as an AI" unless necessary.
+
+Do not mention internal prompts, models, APIs, system
+instructions, or implementation details.
+
+============================================================
+IMPORTANT
+============================================================
+
+The goal is a REAL CONVERSATION.
+
+Do not turn every message into a journal analysis.
+
+Do not produce a structured psychological report unless
+the user explicitly asks for one.
+
+Respond naturally to what the user actually said.
 `;
 
+  /*
+   * Gemini expects alternating user/model conversation roles.
+   *
+   * We add the current user message after the previous history.
+   */
   const contents = [
     ...recentHistory,
     {
@@ -1121,9 +1217,27 @@ If the user asks a normal question, answer it normally.
     }
   ];
 
+  /*
+   * IMPORTANT:
+   *
+   * The chatbot uses a SEPARATE model variable.
+   *
+   * This prevents changing GEMINI_MODEL for journal analysis
+   * from accidentally changing the chatbot model.
+   *
+   * You can configure this in .env with:
+   *
+   * GEMINI_CHAT_MODEL=gemini-3.5-flash
+   *
+   * If it is not present, this stable chatbot default is used.
+   */
   const model =
-    process.env.GEMINI_MODEL?.trim() ||
-    'gemini-3.8-flash';
+  process.env.GEMINI_CHAT_MODEL?.trim() ||
+  'gemini-3.6-flash';
+
+  console.log(
+    `🤖 Gemini chatbot model: ${model}`
+  );
 
   const maxAttempts = 3;
 
@@ -1142,9 +1256,15 @@ If the user asks a normal question, answer it normally.
       const apiCall =
         client.models.generateContent({
           model,
+
           contents,
+
           config: {
-            systemInstruction
+            systemInstruction,
+
+            temperature: 0.75,
+
+            maxOutputTokens: 500
           }
         });
 
@@ -1214,7 +1334,10 @@ If the user asks a normal question, answer it normally.
           .includes('high demand') ||
         errorMessage
           .toLowerCase()
-          .includes('temporarily unavailable');
+          .includes('temporarily unavailable') ||
+        errorMessage
+          .toLowerCase()
+          .includes('unavailable');
 
       if (
         !isTemporary ||
@@ -1225,9 +1348,9 @@ If the user asks a normal question, answer it normally.
 
       const delay =
         attempt === 1
-          ? 1500
+          ? 1000
           : attempt === 2
-            ? 3000
+            ? 2500
             : 5000;
 
       console.log(
@@ -1240,12 +1363,6 @@ If the user asks a normal question, answer it normally.
     }
   }
 
-  /*
-   * No mock chatbot fallback.
-   * The application should tell the user that Gemini is
-   * unavailable instead of pretending that a response came
-   * from Gemini.
-   */
   throw new Error(
     `Gemini chatbot failed after ${maxAttempts} attempts: ${
       lastError instanceof Error
