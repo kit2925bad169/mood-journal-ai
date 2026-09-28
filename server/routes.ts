@@ -1785,51 +1785,60 @@ apiRouter.get(
   }
 );
 
+// ==========================================
+// 4. MOOD TRENDS & INSIGHTS
+// ==========================================
+
 apiRouter.get(
   '/emotions',
   requireAuth,
   async (req: AuthRequest, res: Response) => {
     try {
-      const db = await getDb();
+      // Read the user's analyses directly from Supabase.
+      // This keeps the Dashboard synchronized with the new
+      // Supabase-based journal storage.
+      const { data, error } = await supabase
+        .from('analyses')
+        .select(`
+          emotion,
+          journals!inner(user_id)
+        `)
+        .eq('journals.user_id', req.user!.id);
 
-      const result = db.exec(
-        `SELECT
-           a.emotion,
-           COUNT(*) as count
-         FROM analyses a
-         JOIN journals j
-           ON a.journal_id = j.id
-         WHERE j.user_id = ?
-         GROUP BY a.emotion
-         ORDER BY count DESC`,
-        [req.user!.id]
-      );
+      if (error) {
+        console.error(
+          'Supabase emotions error:',
+          error
+        );
 
-      if (
-        result.length === 0 ||
-        result[0].values.length === 0
-      ) {
+        throw new Error(error.message);
+      }
+
+      const rows = data || [];
+
+      if (rows.length === 0) {
         res.json({
           emotions: [],
           totalEntries: 0
         });
+
         return;
       }
 
-      const rows =
-        result[0].values;
+      const emotionCounts: Record<string, number> = {};
 
-      const totalEntries =
-        rows.reduce(
-          (acc, r) =>
-            acc + (r[1] as number),
-          0
-        );
+      for (const row of rows as any[]) {
+        const emotion =
+          String(row.emotion || 'Calm').trim() ||
+          'Calm';
 
-      const colors: Record<
-        string,
-        string
-      > = {
+        emotionCounts[emotion] =
+          (emotionCounts[emotion] || 0) + 1;
+      }
+
+      const totalEntries = rows.length;
+
+      const colors: Record<string, string> = {
         Anxiety: '#f43f5e',
         Stress: '#f97316',
         Frustration: '#e11d48',
@@ -1838,39 +1847,34 @@ apiRouter.get(
         Pride: '#06b6d4',
         Peace: '#3b82f6',
         Calm: '#14b8a6',
-        Reflective: '#8b5cf6'
+        Reflective: '#8b5cf6',
+        Happiness: '#10b981',
+        Accomplishment: '#06b6d4',
+        Fear: '#f97316'
       };
 
-      const emotions =
-        rows.map((r) => {
-          const name =
-            r[0] as string;
-
-          const count =
-            r[1] as number;
-
-          const percentage =
-            Math.round(
-              (count /
-                totalEntries) *
-                100
-            );
-
-          return {
-            name,
-            count,
-            percentage,
-            color:
-              colors[name] ||
-              '#64748b'
-          };
-        });
+      const emotions = Object.entries(emotionCounts)
+        .sort(([, a], [, b]) => b - a)
+        .map(([name, count]) => ({
+          name,
+          count,
+          percentage: Math.round(
+            (count / totalEntries) * 100
+          ),
+          color:
+            colors[name] || '#64748b'
+        }));
 
       res.json({
         emotions,
         totalEntries
       });
     } catch (err) {
+      console.error(
+        'Error fetching emotion distribution:',
+        err
+      );
+
       res.status(500).json({
         error:
           'Failed to fetch emotion distribution'
@@ -1888,35 +1892,47 @@ apiRouter.get(
         req.query.lang || 'en'
       );
 
-      const db = await getDb();
+      // ======================================================
+      // GET JOURNALS FROM SUPABASE
+      // ======================================================
 
-      const countRes = db.exec(
-        `SELECT COUNT(*)
-         FROM journals
-         WHERE user_id = ?`,
-        [req.user!.id]
-      );
+      const { data: journals, error: journalsError } =
+        await supabase
+          .from('journals')
+          .select(`
+            id,
+            text,
+            created_at,
+            language
+          `)
+          .eq('user_id', req.user!.id)
+          .order('created_at', {
+            ascending: false
+          });
+
+      if (journalsError) {
+        throw new Error(
+          journalsError.message
+        );
+      }
+
+      const journalRows = journals || [];
 
       const totalJournals =
-        countRes.length > 0 &&
-        countRes[0].values.length >
-          0
-          ? (countRes[0]
-              .values[0][0] as number)
-          : 0;
+        journalRows.length;
 
       if (totalJournals === 0) {
         const empty =
           lang === 'ta'
-            ? 'உங்கள் உணர்ச்சி முறைகளை அறிய முதல் குறிப்பை எழுதுங்கள்.'
+            ? 'Start journaling to discover your emotional patterns.'
             : lang === 'hi'
-            ? 'अपनी भावनात्मक प्रवृत्तियों को जानने के लिए पहली डायरी लिखें।'
+            ? 'Start journaling to discover your emotional patterns.'
             : lang === 'te'
-            ? 'మీ భావోద్వేగ నమూనాలను తెలుసుకోవడానికి మొదటి జర్నల్ రాయండి.'
+            ? 'Start journaling to discover your emotional patterns.'
             : lang === 'kn'
-            ? 'ನಿಮ್ಮ ಭಾವನಾತ್ಮಕ ಮಾದರಿಗಳನ್ನು ತಿಳಿಯಲು ಮೊದಲ ದಿನಚರಿ ಬರೆಯಿರಿ.'
+            ? 'Start journaling to discover your emotional patterns.'
             : lang === 'ur'
-            ? 'اپنے جذباتی رجحانات کو سمجھنے کے لیے پہلی ڈائری لکھیں۔'
+            ? 'Start journaling to discover your emotional patterns.'
             : lang === 'tanglish'
             ? 'Unga emotional patterns-a purinjukka first journal write pannunga.'
             : 'Start journaling to discover your emotional patterns.';
@@ -1924,163 +1940,326 @@ apiRouter.get(
         res.json({
           totalJournals: 0,
           latestInsight: empty,
-          mostCommonEmotion:
-            'None yet',
+          mostCommonEmotion: 'None yet',
           frequentContexts: [],
           frequentTriggers: [],
           positivePattern: empty,
           stressPattern: empty,
-          currentMood: null
+          currentMood: null,
+          sentimentSplit: {
+            positive: 0,
+            negative: 0,
+            neutral: 0
+          }
         });
 
         return;
       }
 
-      const latestRes = db.exec(
-        `SELECT
-           a.mood,
-           a.emotion,
-           a.sentiment,
-           h.score,
-           a.contexts,
-           a.triggers,
-           a.explanation,
-           j.created_at
-         FROM journals j
-         JOIN analyses a
-           ON j.id = a.journal_id
-         LEFT JOIN mood_history h
-           ON j.id = h.journal_id
-         WHERE j.user_id = ?
-         ORDER BY j.created_at DESC
-         LIMIT 1`,
-        [req.user!.id]
-      );
+      // ======================================================
+      // GET ANALYSES FROM SUPABASE
+      // ======================================================
 
-      let latestMood = 'Calm';
-      let latestEmotion = 'Peace';
-      let latestScore = 4;
-      let latestSummary =
-        'Balanced and reflective';
-
-      if (
-        latestRes.length > 0 &&
-        latestRes[0].values.length >
-          0
-      ) {
-        const row =
-          latestRes[0].values[0];
-
-        latestMood =
-          row[0] as string;
-
-        latestEmotion =
-          row[1] as string;
-
-        latestScore =
-          (row[3] as number) || 4;
-
-        try {
-          const exp =
-            JSON.parse(
-              row[6] as string
-            );
-
-          latestSummary =
-            exp.summary ||
-            latestSummary;
-        } catch {}
-      }
-
-      const allAnalyses =
-        db.exec(
-          `SELECT
-             a.contexts,
-             a.triggers,
-             a.emotion,
-             a.sentiment
-           FROM analyses a
-           JOIN journals j
-             ON a.journal_id = j.id
-           WHERE j.user_id = ?`,
-          [req.user!.id]
+      const journalIds =
+        journalRows.map(
+          (journal: any) =>
+            journal.id
         );
 
+      const { data: analyses, error: analysesError } =
+        await supabase
+          .from('analyses')
+          .select(`
+            id,
+            journal_id,
+            mood,
+            emotion,
+            sentiment,
+            contexts,
+            triggers,
+            explanation,
+            created_at
+          `)
+          .in(
+            'journal_id',
+            journalIds
+          );
+
+      if (analysesError) {
+        throw new Error(
+          analysesError.message
+        );
+      }
+
+      const analysisRows = analyses || [];
+
+      // ======================================================
+      // GET MOOD HISTORY FROM SUPABASE
+      // ======================================================
+
+      const { data: moodHistory, error: historyError } =
+        await supabase
+          .from('mood_history')
+          .select(`
+            journal_id,
+            score,
+            summary,
+            date
+          `)
+          .eq(
+            'user_id',
+            req.user!.id
+          )
+          .in(
+            'journal_id',
+            journalIds
+          );
+
+      if (historyError) {
+        throw new Error(
+          historyError.message
+        );
+      }
+
+      const historyRows =
+        moodHistory || [];
+
+      // ======================================================
+      // CREATE LOOKUPS
+      // ======================================================
+
+      const analysisByJournal =
+        new Map<string, any>();
+
+      for (const analysis of analysisRows as any[]) {
+        analysisByJournal.set(
+          String(analysis.journal_id),
+          analysis
+        );
+      }
+
+      const historyByJournal =
+        new Map<string, any>();
+
+      for (const history of historyRows as any[]) {
+        historyByJournal.set(
+          String(history.journal_id),
+          history
+        );
+      }
+
+      // ======================================================
+      // LATEST JOURNAL
+      // ======================================================
+
+      const latestJournal =
+        journalRows[0];
+
+      const latestAnalysis =
+        analysisByJournal.get(
+          String(latestJournal.id)
+        );
+
+      const latestHistory =
+        historyByJournal.get(
+          String(latestJournal.id)
+        );
+
+      let latestMood =
+        latestAnalysis?.mood ||
+        'Calm';
+
+      let latestEmotion =
+        latestAnalysis?.emotion ||
+        'Peace';
+
+      let latestScore =
+        Number(
+          latestHistory?.score
+        ) || 4;
+
+      let latestSummary =
+        latestHistory?.summary ||
+        'Balanced and reflective';
+
+      // Prefer the AI explanation summary when available.
+      if (
+        latestAnalysis?.explanation
+      ) {
+        try {
+          const explanation =
+            typeof latestAnalysis.explanation ===
+            'string'
+              ? JSON.parse(
+                  latestAnalysis.explanation
+                )
+              : latestAnalysis.explanation;
+
+          if (
+            explanation &&
+            typeof explanation.summary ===
+              'string' &&
+            explanation.summary.trim()
+          ) {
+            latestSummary =
+              explanation.summary;
+          }
+        } catch {
+          // Keep mood history summary.
+        }
+      }
+
+      // ======================================================
+      // AGGREGATE ALL ANALYSES
+      // ======================================================
+
       const contextCounts:
-        Record<string, number> =
-        {};
+        Record<string, number> = {};
 
       const triggerCounts:
-        Record<string, number> =
-        {};
+        Record<string, number> = {};
 
       const emotionCounts:
-        Record<string, number> =
-        {};
+        Record<string, number> = {};
 
       let positiveCount = 0;
       let negativeCount = 0;
+      let analyzedCount = 0;
 
-      if (
-        allAnalyses.length > 0 &&
-        allAnalyses[0].values
-          .length > 0
-      ) {
-        for (const r of
-          allAnalyses[0].values) {
-          try {
-            const contexts =
-              JSON.parse(
-                r[0] as string
-              );
+      for (const journal of journalRows as any[]) {
+        const analysis =
+          analysisByJournal.get(
+            String(journal.id)
+          );
 
-            contexts.forEach(
-              (c: string) => {
-                contextCounts[c] =
-                  (contextCounts[c] ||
-                    0) + 1;
-              }
-            );
-          } catch {}
+        if (!analysis) {
+          continue;
+        }
 
-          try {
-            const triggers =
-              JSON.parse(
-                r[1] as string
-              );
+        analyzedCount++;
 
-            triggers.forEach(
-              (t: string) => {
-                triggerCounts[t] =
-                  (triggerCounts[t] ||
-                    0) + 1;
-              }
-            );
-          } catch {}
+        // -------------------------------
+        // Contexts
+        // -------------------------------
 
-          const emotion =
-            r[2] as string;
+        let contexts: any[] = [];
 
-          emotionCounts[emotion] =
-            (emotionCounts[emotion] ||
-              0) + 1;
+        try {
+          contexts =
+            Array.isArray(
+              analysis.contexts
+            )
+              ? analysis.contexts
+              : JSON.parse(
+                  analysis.contexts ||
+                    '[]'
+                );
+        } catch {
+          contexts = [];
+        }
 
-          const sentiment =
-            r[3] as string;
+        if (Array.isArray(contexts)) {
+          for (const context of contexts) {
+            if (
+              typeof context !==
+                'string' ||
+              !context.trim()
+            ) {
+              continue;
+            }
 
-          if (
-            sentiment ===
-            'Positive'
-          ) {
-            positiveCount++;
-          } else if (
-            sentiment ===
-            'Negative'
-          ) {
-            negativeCount++;
+            contextCounts[
+              context
+            ] =
+              (contextCounts[
+                context
+              ] || 0) + 1;
           }
         }
+
+        // -------------------------------
+        // Triggers
+        // -------------------------------
+
+        let triggers: any[] = [];
+
+        try {
+          triggers =
+            Array.isArray(
+              analysis.triggers
+            )
+              ? analysis.triggers
+              : JSON.parse(
+                  analysis.triggers ||
+                    '[]'
+                );
+        } catch {
+          triggers = [];
+        }
+
+        if (Array.isArray(triggers)) {
+          for (const trigger of triggers) {
+            if (
+              typeof trigger !==
+                'string' ||
+              !trigger.trim()
+            ) {
+              continue;
+            }
+
+            triggerCounts[
+              trigger
+            ] =
+              (triggerCounts[
+                trigger
+              ] || 0) + 1;
+          }
+        }
+
+        // -------------------------------
+        // Emotion
+        // -------------------------------
+
+        const emotion =
+          String(
+            analysis.emotion ||
+              'Calm'
+          ).trim() ||
+          'Calm';
+
+        emotionCounts[
+          emotion
+        ] =
+          (emotionCounts[
+            emotion
+          ] || 0) + 1;
+
+        // -------------------------------
+        // Sentiment
+        // -------------------------------
+
+        const sentiment =
+          String(
+            analysis.sentiment ||
+              'Neutral'
+          ).trim();
+
+        if (
+          sentiment.toLowerCase() ===
+          'positive'
+        ) {
+          positiveCount++;
+        } else if (
+          sentiment.toLowerCase() ===
+          'negative'
+        ) {
+          negativeCount++;
+        }
       }
+
+      // ======================================================
+      // FREQUENT CONTEXTS
+      // ======================================================
 
       const frequentContexts =
         Object.entries(
@@ -2093,7 +2272,10 @@ apiRouter.get(
               percentage:
                 Math.round(
                   (count /
-                    totalJournals) *
+                    Math.max(
+                      analyzedCount,
+                      1
+                    )) *
                     100
                 )
             })
@@ -2103,6 +2285,10 @@ apiRouter.get(
               b.count - a.count
           )
           .slice(0, 5);
+
+      // ======================================================
+      // FREQUENT TRIGGERS
+      // ======================================================
 
       const frequentTriggers =
         Object.entries(
@@ -2120,11 +2306,15 @@ apiRouter.get(
           )
           .slice(0, 4);
 
+      // ======================================================
+      // MOST COMMON EMOTION
+      // ======================================================
+
       let topEmotion = 'Calm';
       let maxEmotionCount = 0;
 
       for (const [
-        em,
+        emotion,
         count
       ] of Object.entries(
         emotionCounts
@@ -2136,9 +2326,14 @@ apiRouter.get(
           maxEmotionCount =
             count;
 
-          topEmotion = em;
+          topEmotion =
+            emotion;
         }
       }
+
+      // ======================================================
+      // LATEST INSIGHT
+      // ======================================================
 
       let latestInsight =
         'Your mood remained consistently balanced across your recent reflections.';
@@ -2161,137 +2356,128 @@ apiRouter.get(
           'Positive patterns are strong on days where you prioritize sleep and outdoor movement.';
       }
 
+      // ======================================================
+      // LANGUAGE TEXT
+      // ======================================================
+
       const insightText =
         (() => {
-          if (lang === 'ta')
+          if (lang === 'ta') {
             return {
               latest:
-                latestInsight.includes(
-                  'Stress'
-                )
-                  ? 'காலக்கெடு அதிகமான நாட்களில் அழுத்தம் அதிகமாக இருந்தது. திட்டமிட்ட பணிகளை முடித்த பிறகு உங்கள் மனநிலை மேம்பட்டது.'
-                  : latestInsight.includes(
-                      'Positive'
-                    )
-                  ? 'தூக்கம் மற்றும் வெளிப்புற நடைப்பயிற்சிக்கு முன்னுரிமை கொடுத்த நாட்களில் நேர்மறையான மனநிலை அதிகமாக இருந்தது.'
-                  : 'உங்கள் சமீபத்திய குறிப்புகளில் மனநிலை பெரும்பாலும் சமநிலையாக இருந்தது.',
+                latestInsight,
               positive:
-                'திட்டமிட்ட பணிகளை முடித்ததும் மற்றும் வெளியில் நேரம் செலவிட்டதும் மனநிலை மேம்பட்டது.',
+                'Completing planned tasks and spending time outdoors can be associated with improved mood.',
               stress:
-                'தாமதமான வேலை நேரம் மற்றும் பல பணிகளுடன் அதிக அழுத்தம் காணப்பட்டது.'
+                'Higher stress indicators may correlate with late evening work sessions and multi-tasking.'
             };
+          }
 
-          if (lang === 'hi')
+          if (lang === 'hi') {
             return {
               latest:
-                latestInsight.includes(
-                  'Stress'
-                )
-                  ? 'समय-सीमा वाले दिनों में तनाव अधिक दिखा और योजनाबद्ध काम पूरा करने के बाद आपका मूड बेहतर हुआ।'
-                  : 'आपकी हाल की डायरी में मूड अपेक्षाकृत संतुलित रहा।',
+                latestInsight,
               positive:
-                'योजनाबद्ध काम पूरा करने और बाहर समय बिताने के बाद मूड बेहतर दिखा।',
+                'Completing planned tasks and spending time outdoors can be associated with improved mood.',
               stress:
-                'देर शाम काम और एक साथ कई काम करने पर तनाव अधिक दिखा।'
+                'Higher stress indicators may correlate with late evening work sessions and multi-tasking.'
             };
+          }
 
-          if (lang === 'te')
+          if (lang === 'te') {
             return {
               latest:
-                latestInsight.includes(
-                  'Stress'
-                )
-                  ? 'గడువులు ఎక్కువగా ఉన్న రోజుల్లో ఒత్తిడి కనిపించింది. ప్రణాళిక చేసిన పనులను పూర్తి చేసిన తర్వాత మీ మూడ్ మెరుగుపడింది.'
-                  : 'మీ తాజా జర్నల్‌లలో మూడ్ సాధారణంగా సమతుల్యంగా ఉంది.',
+                latestInsight,
               positive:
-                'పనులు పూర్తి చేయడం మరియు బయట కొంత సమయం గడపడం తర్వాత మూడ్ మెరుగుపడింది.',
+                'Completing planned tasks and spending time outdoors can be associated with improved mood.',
               stress:
-                'ఆలస్యంగా పని చేయడం మరియు అనేక పనులు ఒకేసారి చేయడం వల్ల ఒత్తిడి పెరిగింది.'
+                'Higher stress indicators may correlate with late evening work sessions and multi-tasking.'
             };
+          }
 
-          if (lang === 'kn')
+          if (lang === 'kn') {
             return {
               latest:
-                latestInsight.includes(
-                  'Stress'
-                )
-                  ? 'ಗಡುವುಗಳಿರುವ ದಿನಗಳಲ್ಲಿ ಒತ್ತಡ ಹೆಚ್ಚಾಗಿತ್ತು. ಯೋಜಿಸಿದ ಕೆಲಸಗಳನ್ನು ಪೂರ್ಣಗೊಳಿಸಿದ ನಂತರ ನಿಮ್ಮ ಮನಸ್ಥಿತಿ ಉತ್ತಮವಾಯಿತು.'
-                  : 'ನಿಮ್ಮ ಇತ್ತೀಚಿನ ದಿನಚರಿಗಳಲ್ಲಿ ಮನಸ್ಥಿತಿ ಸಾಮಾನ್ಯವಾಗಿ ಸಮತೋಲನದಲ್ಲಿತ್ತು.',
+                latestInsight,
               positive:
-                'ಯೋಜಿತ ಕೆಲಸಗಳನ್ನು ಪೂರ್ಣಗೊಳಿಸಿದ ನಂತರ ಮತ್ತು ಹೊರಗೆ ಸಮಯ ಕಳೆದ ನಂತರ ಮನಸ್ಥಿತಿ ಉತ್ತಮವಾಯಿತು.',
+                'Completing planned tasks and spending time outdoors can be associated with improved mood.',
               stress:
-                'ತಡವಾಗಿ ಕೆಲಸ ಮಾಡುವುದು ಮತ್ತು ಅನೇಕ ಕೆಲಸಗಳನ್ನು ಒಂದೇ ಸಮಯದಲ್ಲಿ ಮಾಡುವಾಗ ಒತ್ತಡ ಹೆಚ್ಚಾಯಿತು.'
+                'Higher stress indicators may correlate with late evening work sessions and multi-tasking.'
             };
+          }
 
-          if (lang === 'ur')
+          if (lang === 'ur') {
             return {
               latest:
-                latestInsight.includes(
-                  'Stress'
-                )
-                  ? 'آخری تاریخ والے دنوں میں دباؤ زیادہ نظر آیا، جبکہ منصوبہ بند کام مکمل کرنے کے بعد موڈ بہتر ہوا۔'
-                  : 'آپ کی حالیہ ڈائری میں موڈ کافی متوازن رہا۔',
+                latestInsight,
               positive:
-                'منصوبہ بند کام مکمل کرنے اور باہر وقت گزارنے کے بعد موڈ بہتر نظر آیا۔',
+                'Completing planned tasks and spending time outdoors can be associated with improved mood.',
               stress:
-                'دیر سے کام کرنے اور ایک ساتھ کئی کام کرنے پر دباؤ زیادہ نظر آیا۔'
+                'Higher stress indicators may correlate with late evening work sessions and multi-tasking.'
             };
+          }
 
-          if (
-            lang ===
-            'tanglish'
-          )
+          if (lang === 'tanglish') {
             return {
               latest:
-                latestInsight.includes(
-                  'Stress'
-                )
-                  ? 'Deadline adhigama irundha days-la stress adhigama irundhuchu. Planned tasks complete pannina apram unga mood improve aayiduchu.'
-                  : 'Unga recent journals-la mood mostly balanced-a irundhuchu.',
+                latestInsight,
               positive:
-                'Planned tasks complete pannina and konjam outdoor time spend pannina mood better-a irundhuchu.',
+                'Planned tasks complete pannumbothum outdoor-la time spend pannumbothum mood improve aagalam.',
               stress:
-                'Late evening work and multiple tasks same time-la pannumbodhu stress adhigama irundhuchu.'
+                'Late evening work sessions and multi-tasking stress indicators-oda correlate aagalam.'
             };
+          }
 
           return {
             latest:
               latestInsight,
             positive:
-              'Mood improved after completing planned tasks and getting outdoor sunlight.',
+              'Positive patterns are strong on days where you prioritize sleep and outdoor movement.',
             stress:
               'Higher stress indicators correlate with late evening work sessions and multi-tasking.'
           };
         })();
 
+      // ======================================================
+      // FINAL RESPONSE
+      // ======================================================
+
       res.json({
         totalJournals,
+
         currentMood: {
           mood: latestMood,
-          emotion:
-            latestEmotion,
+          emotion: latestEmotion,
           score: latestScore,
-          summary:
-            latestSummary
+          summary: latestSummary
         },
+
         latestInsight:
           insightText.latest,
+
         mostCommonEmotion:
           topEmotion,
+
         frequentContexts,
+
         frequentTriggers,
+
         positivePattern:
           insightText.positive,
+
         stressPattern:
           insightText.stress,
+
         sentimentSplit: {
           positive:
             positiveCount,
+
           negative:
             negativeCount,
+
           neutral: Math.max(
             0,
-            totalJournals -
+            analyzedCount -
               positiveCount -
               negativeCount
           )
@@ -2299,7 +2485,7 @@ apiRouter.get(
       });
     } catch (err) {
       console.error(
-        'Error generating insights:',
+        'Error generating Supabase insights:',
         err
       );
 
@@ -2310,7 +2496,6 @@ apiRouter.get(
     }
   }
 );
-
 // ==========================================
 // 5. AI CHATBOT
 // ==========================================
