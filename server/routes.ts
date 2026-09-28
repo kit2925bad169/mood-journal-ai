@@ -1660,131 +1660,105 @@ apiRouter.get(
         metric = 'mood'
       } = req.query;
 
-      const db = await getDb();
-
       let days = 7;
 
-      if (range === '30d')
+      if (range === '30d') {
         days = 30;
-      else if (range === '3m')
+      } else if (range === '3m') {
         days = 90;
-      else if (range === '6m')
+      } else if (range === '6m') {
         days = 180;
-      else if (range === '1y')
+      } else if (range === '1y') {
         days = 365;
+      }
 
-      const cutoffDate =
-        new Date(
-          Date.now() -
-            days * 86400000
-        ).toISOString();
+      const cutoffDate = new Date(
+        Date.now() - days * 86400000
+      ).toISOString();
 
-      const result = db.exec(
-        `SELECT
-           h.id,
-           h.journal_id,
-           h.mood,
-           h.emotion,
-           h.sentiment,
-           h.score,
-           h.summary,
-           h.date,
-           j.created_at,
-           a.contexts
-         FROM mood_history h
-         JOIN journals j
-           ON h.journal_id = j.id
-         LEFT JOIN analyses a
-           ON h.journal_id = a.journal_id
-         WHERE h.user_id = ?
-           AND j.created_at >= ?
-         ORDER BY j.created_at ASC`,
-        [
-          req.user!.id,
-          cutoffDate
-        ]
-      );
+      // Get the user's mood history from Supabase.
+      const { data, error } = await supabase
+        .from('mood_history')
+        .select(`
+          id,
+          journal_id,
+          mood,
+          emotion,
+          sentiment,
+          score,
+          summary,
+          date,
+          user_id,
+          journals!inner(
+            created_at,
+            language
+          )
+        `)
+        .eq('user_id', req.user!.id)
+        .gte('journals.created_at', cutoffDate)
+        .order('date', {
+          ascending: true
+        });
 
-      if (result.length === 0) {
+      if (error) {
+        console.error(
+          'Supabase mood trends error:',
+          error
+        );
+
+        throw new Error(error.message);
+      }
+
+      const rows = data || [];
+
+      if (rows.length === 0) {
         res.json({
           trends: [],
           hasEnoughData: false,
           totalCount: 0
         });
+
         return;
       }
 
-      const columns =
-        result[0].columns;
-
-      const trends =
-        result[0].values.map(
-          (row) => {
-            const item: Record<
-              string,
-              any
-            > = {};
-
-            columns.forEach(
-              (col, idx) => {
-                item[col] =
-                  row[idx];
-              }
-            );
-
-            const parsedContexts =
-              item.contexts
-                ? JSON.parse(
-                    item.contexts
-                  )
-                : [];
-
-            return {
-              id: item.id,
-              journalId:
-                item.journal_id,
-              date: item.date,
-              createdAt:
-                item.created_at,
-              language:
-                item.language ||
-                'en',
-              mood: item.mood,
-              emotion:
-                item.emotion,
-              sentiment:
-                item.sentiment,
-              score: item.score,
-              summary:
-                item.summary,
-              context:
-                parsedContexts[0] ||
-                'General'
-            };
-          }
-        );
+      const trends = rows.map((item: any) => ({
+        id: item.id,
+        journalId: item.journal_id,
+        date: item.date,
+        createdAt:
+          item.journals?.created_at ||
+          item.date,
+        language:
+          item.journals?.language ||
+          'en',
+        mood: item.mood,
+        emotion: item.emotion,
+        sentiment: item.sentiment,
+        score: Number(item.score) || 0,
+        summary: item.summary,
+        context: 'General'
+      }));
 
       res.json({
         trends,
-        hasEnoughData:
-          trends.length >= 2,
-        totalCount:
-          trends.length
+        hasEnoughData: trends.length >= 2,
+        totalCount: trends.length
       });
-    } catch (err) {
+    } catch (err: any) {
       console.error(
-        'Error fetching mood trends:',
+        'Error fetching Supabase mood trends:',
         err
       );
 
       res.status(500).json({
-        error:
-          'Failed to fetch mood trends'
+        error: 'Failed to fetch mood trends',
+        details:
+          err?.message ||
+          'Unknown error'
       });
     }
   }
 );
-
 // ==========================================
 // 4. MOOD TRENDS & INSIGHTS
 // ==========================================
