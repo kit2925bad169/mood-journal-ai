@@ -40,38 +40,26 @@ async function ensureRequiredGoals(userId: string) {
   if (error) throw new Error(error.message);
 
   const existingRows = existing || [];
-
-  const goalKey = (title: unknown) =>
-    String(title || '')
-      .normalize('NFKC')
-      .replace(/[^a-zA-Z0-9]+/g, ' ')
-      .trim()
-      .toLowerCase();
-
-  const existingByKey = new Map<string, any>();
+  const existingByTitle = new Map<string, any>();
 
   for (const goal of existingRows) {
-    const key = goalKey(goal.title);
-    if (key && !existingByKey.has(key)) {
-      existingByKey.set(key, goal);
+    const key = normalizeGoalTitle(goal.title);
+    if (!existingByTitle.has(key)) {
+      existingByTitle.set(key, goal);
     }
   }
 
-  const selected: any[] = [];
-  const missing: Array<(typeof REQUIRED_GOALS)[number]> = [];
-
-  for (const requiredGoal of REQUIRED_GOALS) {
-    const key = goalKey(requiredGoal.title);
-    const existingGoal = existingByKey.get(key);
-
-    if (existingGoal) selected.push(existingGoal);
-    else missing.push(requiredGoal);
-  }
+  const missing = REQUIRED_GOALS.filter(
+    (goal) => !existingByTitle.has(normalizeGoalTitle(goal.title))
+  );
 
   if (missing.length > 0) {
     const now = new Date().toISOString();
+
     const rows = missing.map((goal, index) => ({
-      id: `goal_default_${Date.now()}_${index}_${Math.random().toString(36).slice(2, 7)}`,
+      id:
+        `goal_default_${Date.now()}_${index}_` +
+        Math.random().toString(36).slice(2, 7),
       user_id: userId,
       title: goal.title,
       frequency: goal.frequency,
@@ -85,24 +73,17 @@ async function ensureRequiredGoals(userId: string) {
       .select('id, title, frequency, progress, created_at');
 
     if (insertError) throw new Error(insertError.message);
-    selected.push(...(inserted || []));
+
+    existingRows.push(...(inserted || []));
   }
 
-  const finalByKey = new Map<string, any>();
-  for (const goal of selected) {
-    const key = goalKey(goal.title);
-    if (key && !finalByKey.has(key)) finalByKey.set(key, goal);
-  }
+  const requiredTitles = new Set(
+    REQUIRED_GOALS.map((goal) => normalizeGoalTitle(goal.title))
+  );
 
-  const result = REQUIRED_GOALS
-    .map((requiredGoal) => finalByKey.get(goalKey(requiredGoal.title)))
-    .filter(Boolean);
-
-  if (result.length !== REQUIRED_GOALS.length) {
-    throw new Error(`Goal setup failed: expected exactly ${REQUIRED_GOALS.length} goals but found ${result.length}.`);
-  }
-
-  return result;
+  return existingRows.filter((goal) =>
+    requiredTitles.has(normalizeGoalTitle(goal.title))
+  );
 }
 
 
@@ -128,9 +109,7 @@ async function verifyAllGoalsWithGemini(
     throw new Error('Gemini API key is missing or invalid.');
   }
 
-  const cleanJournal = String(journalText || '').trim();
-
-  if (!cleanJournal) {
+  if (!journalText.trim()) {
     throw new Error('The selected journal is empty.');
   }
 
@@ -138,13 +117,12 @@ async function verifyAllGoalsWithGemini(
     apiKey,
     httpOptions: {
       headers: {
-        'User-Agent': 'mood-journal-ai',
-      },
-    },
+        'User-Agent': 'mood-journal-ai'
+      }
+    }
   });
 
-  const configuredModel =
-    process.env.GEMINI_MODEL?.trim() || 'gemini-3.5-flash-lite';
+  const model = process.env.GEMINI_MODEL?.trim() || 'gemini-3.5-flash';
 
   const goalList = goals
     .map((goal) => `${goal.id} | ${goal.title}`)
@@ -153,122 +131,97 @@ async function verifyAllGoalsWithGemini(
   const prompt = `
 You are the goal-evidence evaluator for Mood Journal AI.
 
-Analyze ONLY THIS ONE SELECTED JOURNAL ENTRY.
-Do not use previous journals, history, memory, or database information.
+Analyze ONLY the SELECTED JOURNAL below.
+Do not use any other journal, previous history, memory, or database information.
 
-Evaluate the journal against EVERY supplied goal.
-Understand meaning, not simple keyword matching.
+Evaluate the selected journal against EVERY goal listed below.
+Understand the meaning of the journal rather than matching keywords.
 
-RULES:
-- verified=true ONLY when the journal clearly describes something that actually happened.
-- Plans, wishes, intentions, fears, hopes, recommendations, and future actions are NOT evidence.
-- A goal keyword alone is NOT evidence.
+IMPORTANT:
+- verified=true ONLY when the journal clearly describes a behavior or outcome that actually happened.
+- Plans, wishes, intentions, fears, hopes, recommendations, or future actions are NOT evidence.
+- A goal keyword appearing in the journal is NOT enough.
 - Do not invent missing facts.
-- Do not infer an action from positive emotion alone.
-- Understand English, Tamil, Tanglish, Telugu, Hindi, Urdu, Kannada, Malayalam, and mixed-language writing.
-- Ignore unrelated parts.
-- Do not diagnose medical or mental-health conditions.
+- Do not infer an action merely from a positive emotion.
+- The journal may be written in English, Tamil, Tanglish, Telugu, Hindi, Urdu, Kannada, Malayalam, or mixed language.
+- Interpret the meaning before deciding.
+- Ignore unrelated parts of the journal.
+- Do not diagnose any medical or mental-health condition.
 
 GOAL RULES:
 
 Reduce Stress:
-Verify actual calming, relaxation, stress management, meditation, breathing, a break, or clearly reduced stress.
+Verify only when the journal clearly describes actually reducing, relieving, calming, or managing stress, such as a calming activity, relaxation, meditation, breathing, a break, or explicitly saying stress was reduced.
 
 Connect With Others:
-Verify actually meeting, talking, calling, visiting, or spending meaningful time with another person. Merely mentioning or missing family/friends does not count.
+Verify only when the journal describes actually meeting, talking with, calling, visiting, spending meaningful time with, or connecting with another person.
+Mentioning family/friends or missing them does not count by itself.
 
 Help Others:
-Verify actually helping, supporting, assisting, teaching, comforting, sharing with, or doing something useful for another person.
+Verify only when the journal describes actually helping, supporting, assisting, teaching, comforting, sharing with, or doing something useful for another person.
 
 Explore New Places:
-Verify actually visiting, going to, exploring, discovering, or spending time in a new/unfamiliar place. Wanting, planning, or fearing exploration does not count.
+Verify only when the journal describes actually visiting, going to, exploring, discovering, or spending time in a new or unfamiliar place.
+Statements such as wanting, planning, or being afraid to explore do not count.
 
 Drink Enough Water:
-Verify actual drinking of enough/plenty of water or completed hydration behavior. “I am hydrated” can count as current completed evidence. “I want to drink more water” does not count.
+Verify only when the journal clearly describes actually drinking water, drinking enough water, or staying hydrated through completed hydration behavior.
+The phrase "I am hydrated" can count when it clearly describes the user's current completed hydration state, but a future intention such as "I want to drink more water" must not count.
 
 Improve Sleep:
-Verify actually sleeping well, getting enough sleep, sleeping sufficiently, or having restful/good-quality sleep. Wanting or planning to sleep better does not count.
+Verify only when the journal clearly describes actually sleeping well, getting enough sleep, sleeping sufficiently, or having restful/good-quality sleep.
+Statements about wanting or planning to sleep better do not count.
 
 GOALS:
 ${goalList}
 
 SELECTED JOURNAL:
-${cleanJournal}
+${journalText}
 
-Return exactly one result for every supplied goal and use the exact goalId values.
+Return ONLY valid JSON with this exact shape:
+{
+  "results": [
+    {
+      "goalId": "exact goal id",
+      "verified": true,
+      "reason": "short explanation",
+      "evidence": "short evidence from the selected journal"
+    }
+  ]
+}
+
+Return exactly one result for every supplied goal.
+Use the exact goalId values supplied above.
 `;
 
-  const responseSchema = {
-    type: 'object',
-    properties: {
-      results: {
-        type: 'array',
-        items: {
-          type: 'object',
-          properties: {
-            goalId: { type: 'string' },
-            verified: { type: 'boolean' },
-            reason: { type: 'string' },
-            evidence: { type: 'string' },
-          },
-          required: ['goalId', 'verified', 'reason', 'evidence'],
-        },
-      },
-    },
-    required: ['results'],
-  };
+  let lastError: unknown = null;
 
-  const modelsToTry = [
-    configuredModel,
-    'gemini-3.5-flash-lite',
-    'gemini-3.5-flash',
-  ].filter(
-    (value, index, array) =>
-      Boolean(value) && array.indexOf(value) === index
-  );
-
-  let lastError: any = null;
-
-  for (const selectedModel of modelsToTry) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      console.log('Gemini goal analysis starting:', {
-        model: selectedModel,
-        goalCount: goals.length,
-        journalLength: cleanJournal.length,
-      });
-
-      const interaction: any = await Promise.race([
-        genAI.interactions.create({
-          model: selectedModel,
-          input: prompt,
-          response_format: {
-            type: 'text',
-            mime_type: 'application/json',
-            schema: responseSchema,
-          },
+      const response: any = await Promise.race([
+        genAI.models.generateContent({
+          model,
+          contents: prompt
         }),
         new Promise<never>((_, reject) => {
           setTimeout(
-            () =>
-              reject(
-                new Error(
-                  `Gemini goal analysis timed out after 90000ms using ${selectedModel}.`
-                )
-              ),
-            90000
+            () => reject(new Error('Gemini goal analysis timed out after 30000ms.')),
+            30000
           );
-        }),
+        })
       ]);
 
-      const text = String(
-        interaction?.output_text || ''
-      ).trim();
+      let text = String(response?.text || '').trim();
 
       if (!text) {
-        throw new Error(
-          `Gemini returned an empty structured response using ${selectedModel}.`
-        );
+        throw new Error('Gemini returned an empty response.');
       }
+
+      text = text
+        .replace(/^```json\s*/i, '')
+        .replace(/^```\s*/i, '')
+        .replace(/\s*```$/i, '')
+        .trim();
 
       let parsed: any;
 
@@ -279,9 +232,7 @@ Return exactly one result for every supplied goal and use the exact goalId value
         const end = text.lastIndexOf('}');
 
         if (start < 0 || end <= start) {
-          throw new Error(
-            `Gemini returned invalid JSON using ${selectedModel}: ${text.slice(0, 500)}`
-          );
+          throw new Error(`Gemini returned invalid JSON: ${text.slice(0, 500)}`);
         }
 
         parsed = JSON.parse(text.slice(start, end + 1));
@@ -291,79 +242,35 @@ Return exactly one result for every supplied goal and use the exact goalId value
         ? parsed.results
         : [];
 
-      if (rawResults.length === 0) {
-        throw new Error(
-          `Gemini returned no goal results using ${selectedModel}.`
-        );
-      }
-
-      console.log('Gemini goal analysis succeeded:', {
-        model: selectedModel,
-        resultCount: rawResults.length,
-      });
-
       return goals.map((goal) => {
         const found = rawResults.find(
-          (item: any) =>
-            String(item?.goalId) === String(goal.id)
+          (item: any) => String(item?.goalId) === String(goal.id)
         );
 
         return {
           goalId: goal.id,
           verified: found?.verified === true,
           reason:
-            typeof found?.reason === 'string' &&
-            found.reason.trim()
+            typeof found?.reason === 'string' && found.reason.trim()
               ? found.reason.trim()
               : 'The selected journal does not clearly verify this goal.',
           evidence:
-            typeof found?.evidence === 'string'
-              ? found.evidence.trim()
-              : '',
+            typeof found?.evidence === 'string' ? found.evidence.trim() : ''
         };
       });
     } catch (err: any) {
       lastError = err;
+      console.error(`Gemini all-goal analysis attempt ${attempt} failed:`, err?.message || err);
 
-      const message = String(
-        err?.message || err
-      );
-
-      console.error(
-        `Gemini goal analysis failed using ${selectedModel}:`,
-        message
-      );
-
-      const status = Number(
-        err?.status ||
-          err?.code ||
-          err?.error?.code ||
-          0
-      );
-
-      const temporary =
-        status === 429 ||
-        status === 500 ||
-        status === 502 ||
-        status === 503 ||
-        status === 504 ||
-        /429|500|502|503|504|quota|resource.?exhausted|high demand|temporarily unavailable|fetch failed|timeout/i.test(
-          message
-        );
-
-      if (!temporary) {
-        throw new Error(
-          `Gemini goal analysis failed using ${selectedModel}: ${message}`
-        );
+      if (attempt < 3) {
+        await new Promise((resolve) => setTimeout(resolve, attempt * 1500));
       }
     }
   }
 
-  throw new Error(
-    `All Gemini goal-analysis attempts failed. Last error: ${
-      lastError?.message || String(lastError)
-    }`
-  );
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('Gemini could not analyze the selected journal.');
 }
 
 // ==========================================
@@ -4406,6 +4313,7 @@ apiRouter.delete(
   }
 );// ==========================================
 // VOICE TRANSCRIPTION
+// Dedicated Gemini 3.5 Transcribe implementation
 // ==========================================
 
 apiRouter.post(
@@ -4421,35 +4329,64 @@ apiRouter.post(
       } = req.body;
 
       if (!audio || typeof audio !== 'string') {
-        res.status(400).json({ error: 'Audio data is required.' });
+        res.status(400).json({
+          error: 'Audio data is required.',
+        });
         return;
       }
 
       if (audio.length > 18000000) {
-        res.status(413).json({ error: 'Audio is too large. Please record a shorter message.' });
+        res.status(413).json({
+          error:
+            'Audio is too large. Please record a shorter message.',
+        });
         return;
       }
 
       const apiKey = process.env.GEMINI_API_KEY?.trim();
-      if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || apiKey === 'YOUR_GEMINI_API_KEY' || apiKey === 'YOUR_ACTUAL_GEMINI_API_KEY') {
-        res.status(500).json({ error: 'Gemini API key is missing or invalid.' });
+
+      if (
+        !apiKey ||
+        apiKey === 'MY_GEMINI_API_KEY' ||
+        apiKey === 'YOUR_GEMINI_API_KEY' ||
+        apiKey === 'YOUR_ACTUAL_GEMINI_API_KEY'
+      ) {
+        res.status(500).json({
+          error: 'Gemini API key is missing.',
+        });
         return;
       }
 
       const genAI = new GoogleGenAI({
         apiKey,
-        httpOptions: { headers: { 'User-Agent': 'mood-journal-ai' } },
+        httpOptions: {
+          headers: {
+            'User-Agent': 'mood-journal-ai',
+          },
+        },
       });
 
-      const finalMimeType = typeof mimeType === 'string' && mimeType.trim()
-        ? mimeType.trim().split(';')[0]
-        : 'audio/webm';
+      const normalizedLanguage = String(language)
+        .toLowerCase()
+        .trim();
+
+      const finalMimeType =
+        typeof mimeType === 'string' && mimeType.trim()
+          ? mimeType.split(';')[0].trim()
+          : 'audio/webm';
 
       const audioBuffer = Buffer.from(audio, 'base64');
+
       if (!audioBuffer.length) {
-        res.status(400).json({ error: 'The recorded audio is empty.' });
+        res.status(400).json({
+          error: 'The recorded audio is empty.',
+        });
         return;
       }
+
+      const audioBlob = new Blob([audioBuffer], {
+        type: finalMimeType,
+      });
 
       console.log('Uploading voice journal to Gemini Transcribe:', {
         language,
@@ -4458,24 +4395,55 @@ apiRouter.post(
         audioBytes: audioBuffer.length,
       });
 
-      const audioBlob = new Blob([audioBuffer], { type: finalMimeType });
-
       const audioFile = await Promise.race([
         genAI.files.upload({
           file: audioBlob,
-          config: { mimeType: finalMimeType },
+          config: {
+            mimeType: finalMimeType,
+          },
         }),
         new Promise<never>((_, reject) => {
-          setTimeout(() => reject(new Error('Gemini audio upload timed out after 60000ms.')), 60000);
+          setTimeout(
+            () =>
+              reject(
+                new Error(
+                  'Gemini audio upload timed out after 60000ms.'
+                )
+              ),
+            60000
+          );
         }),
       ]);
 
       if (!audioFile?.uri) {
-        throw new Error('Gemini did not return an uploaded audio URI.');
+        throw new Error(
+          'Gemini did not return an uploaded audio URI.'
+        );
       }
 
-      // Automatic language detection is intentional here. Gemini Transcribe
-      // supports multilingual code-switching, including Tamil + English.
+      const languageCodes: string[] = [];
+
+      if (normalizedLanguage === 'en') {
+        languageCodes.push('en-IN');
+      } else if (
+        normalizedLanguage === 'ta' ||
+        normalizedLanguage.includes('tamil')
+      ) {
+        languageCodes.push('ta-IN');
+      } else if (normalizedLanguage === 'hi') {
+        languageCodes.push('hi-IN');
+      } else if (normalizedLanguage === 'te') {
+        languageCodes.push('te-IN');
+      } else if (normalizedLanguage === 'kn') {
+        languageCodes.push('kn-IN');
+      } else if (normalizedLanguage === 'ml') {
+        languageCodes.push('ml-IN');
+      } else if (normalizedLanguage === 'ur') {
+        languageCodes.push('ur-IN');
+      }
+      // For Tanglish/mixed language, leave language_codes empty so
+      // Gemini can automatically detect and code-switch.
+
       const interaction = await Promise.race([
         genAI.interactions.create({
           model: 'gemini-3.5-transcribe',
@@ -4483,25 +4451,43 @@ apiRouter.post(
             {
               type: 'audio',
               uri: audioFile.uri,
-              mime_type: audioFile.mimeType || finalMimeType,
+              mime_type:
+                audioFile.mimeType || finalMimeType,
             },
           ],
           generation_config: {
             transcription_config: {
               mode: 'smart',
-              language_codes: [],
+              language_codes: languageCodes,
             },
           },
         }),
         new Promise<never>((_, reject) => {
-          setTimeout(() => reject(new Error('Gemini transcription timed out after 60000ms.')), 60000);
+          setTimeout(
+            () =>
+              reject(
+                new Error(
+                  'Gemini transcription timed out after 60000ms.'
+                )
+              ),
+            60000
+          );
         }),
       ]);
 
-      const finalText = String(interaction?.output_text || '').trim();
+      const finalText =
+        interaction?.output_text?.trim() || '';
+
       if (!finalText) {
-        throw new Error('Gemini returned an empty transcription.');
+        throw new Error(
+          'Gemini returned an empty transcription.'
+        );
       }
+
+      console.log('Voice transcription completed:', {
+        characters: finalText.length,
+        language,
+      });
 
       res.json({
         success: true,
@@ -4510,11 +4496,19 @@ apiRouter.post(
         languageName,
       });
     } catch (err: any) {
-      console.error('Voice transcription error:', err);
+      console.error(
+        'Voice transcription error:',
+        err
+      );
+
+      const message =
+        err?.message ||
+        err?.error?.message ||
+        String(err);
 
       res.status(502).json({
         error: 'Voice transcription failed',
-        details: err?.message || err?.error?.message || String(err),
+        details: message,
       });
     }
   }

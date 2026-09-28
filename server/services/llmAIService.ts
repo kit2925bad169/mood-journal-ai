@@ -1,14 +1,14 @@
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI } from '@google/genai';
 import { AIAnalysisResult, SupportedLanguage } from './aiTypes.js';
 import { PreprocessedJournal } from './preprocessing.js';
+import { runMockAnalysis } from './mockAIService.js';
 
 let genAIClient: GoogleGenAI | null = null;
 
-/* ============================================================
-   GEMINI CLIENT
-   ============================================================ */
+const JOURNAL_MODEL = 'gemini-3.6-flash';
+const CHAT_MODEL = 'gemini-3.6-flash';
 
-function getClient(): GoogleGenAI {
+function getClient(): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
 
   if (
@@ -17,9 +17,7 @@ function getClient(): GoogleGenAI {
     apiKey === 'YOUR_GEMINI_API_KEY' ||
     apiKey === 'YOUR_ACTUAL_GEMINI_API_KEY'
   ) {
-    throw new Error(
-      'GEMINI_API_KEY is missing. Add a valid Gemini API key to the server .env file.'
-    );
+    return null;
   }
 
   if (!genAIClient) {
@@ -36,916 +34,575 @@ function getClient(): GoogleGenAI {
   return genAIClient;
 }
 
-/* ============================================================
-   LANGUAGE NAMES
-   ============================================================ */
+function cleanJson(text: string): string {
+  return text
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+}
 
-const languageNames: Record<SupportedLanguage, string> = {
-  en: 'English',
-  ta: 'Tamil',
-  hi: 'Hindi',
-  ml: 'Malayalam',
-  te: 'Telugu',
-  kn: 'Kannada',
-  ur: 'Urdu',
-  tanglish:
-    'natural Tanglish, meaning Tamil-English mixed language written mainly using English letters'
-};
+/**
+ * Detect Gemini quota errors.
+ *
+ * 429 is NOT treated as a temporary retry error.
+ * The free quota can remain exhausted for a while, so repeatedly
+ * sending requests only creates more failures.
+ */
+function isQuotaError(error: any): boolean {
+  const message = String(
+    error?.message ||
+      error?.error?.message ||
+      error ||
+      ''
+  ).toLowerCase();
 
-/* ============================================================
-   HELPERS
-   ============================================================ */
+  const code = Number(
+    error?.status ||
+      error?.error?.code ||
+      error?.code ||
+      0
+  );
 
-function clampNumber(
-  value: unknown,
-  min: number,
-  max: number,
-  fallback: number
-): number {
-  const numberValue = Number(value);
+  return (
+    code === 429 ||
+    message.includes('429') ||
+    message.includes('resource_exhausted') ||
+    message.includes('quota exceeded') ||
+    message.includes('quotaexceeded') ||
+    message.includes('free_tier_requests') ||
+    message.includes('generaterequestsperdayperproject-freetier') ||
+    message.includes('rate limit')
+  );
+}
 
-  if (!Number.isFinite(numberValue)) {
-    return fallback;
+/**
+ * Only these errors should be retried.
+ *
+ * IMPORTANT:
+ * 429 quota errors are intentionally excluded.
+ */
+function isRetryableGeminiError(error: any): boolean {
+  if (isQuotaError(error)) {
+    return false;
   }
 
-  return Math.min(max, Math.max(min, numberValue));
+  const message = String(
+    error?.message ||
+      error?.error?.message ||
+      error ||
+      ''
+  ).toLowerCase();
+
+  const code = Number(
+    error?.status ||
+      error?.error?.code ||
+      error?.code ||
+      0
+  );
+
+  return (
+    code === 500 ||
+    code === 502 ||
+    code === 503 ||
+    code === 504 ||
+    message.includes('500') ||
+    message.includes('502') ||
+    message.includes('503') ||
+    message.includes('504') ||
+    message.includes('high demand') ||
+    message.includes('temporarily unavailable') ||
+    message.includes('service unavailable')
+  );
 }
-
-function cleanString(value: unknown, fallback = ''): string {
-  if (typeof value !== 'string') {
-    return fallback;
-  }
-
-  return value.trim();
-}
-
-function cleanStringArray(value: unknown): string[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  return value
-    .filter((item) => typeof item === 'string')
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
-function uniqueStrings(values: string[]): string[] {
-  return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
-}
-
-function limitArray(values: string[], max = 8): string[] {
-  return uniqueStrings(values).slice(0, max);
-}
-
-/* ============================================================
-   NORMALIZE GEMINI ANALYSIS
-   ============================================================ */
 
 function normalizeAnalysis(
-  raw: any,
-  rawText: string,
-  lang: SupportedLanguage
-): AIAnalysisResult {
-  const safeRaw = raw && typeof raw === 'object' ? raw : {};
-
-  const explanationRaw =
-    safeRaw.explanation &&
-    typeof safeRaw.explanation === 'object'
-      ? safeRaw.explanation
-      : {};
-
-  const safetyRaw =
-    safeRaw.safetyCheck &&
-    typeof safeRaw.safetyCheck === 'object'
-      ? safeRaw.safetyCheck
-      : {};
-
-  const suggestionsRaw = Array.isArray(safeRaw.suggestions)
-    ? safeRaw.suggestions
-    : [];
-
-  const suggestions = suggestionsRaw
-    .filter(
-      (item: any) =>
-        item &&
-        typeof item === 'object' &&
-        typeof item.title === 'string' &&
-        typeof item.description === 'string'
-    )
-    .map((item: any) => ({
-      title: item.title.trim(),
-      description: item.description.trim(),
-      category:
-        typeof item.category === 'string'
-          ? item.category.trim()
-          : 'general'
-    }))
-    .filter(
-      (item: {
-        title: string;
-        description: string;
-        category: string;
-      }) => item.title && item.description
-    )
-    .slice(0, 5);
-
-  const mood = cleanString(safeRaw.mood, 'Neutral');
-  const emotion = cleanString(safeRaw.emotion, 'Neutral');
-  const sentiment = cleanString(safeRaw.sentiment, 'Neutral');
-
-  const moodScore = Math.round(
-    clampNumber(safeRaw.moodScore, 1, 5, 3)
-  );
-
-  const confidence = clampNumber(
-    safeRaw.confidence,
-    0,
-    1,
-    0.7
-  );
-
-  const contexts = limitArray(
-    cleanStringArray(safeRaw.contexts)
-  );
-
-  const keywords = limitArray(
-    cleanStringArray(safeRaw.keywords),
-    12
-  );
-
-  const triggers = limitArray(
-    cleanStringArray(safeRaw.triggers)
-  );
-
-  const explicitMentions = limitArray(
-    cleanStringArray(explanationRaw.explicitMentions),
-    8
-  );
-
-  const aiInferences = limitArray(
-    cleanStringArray(explanationRaw.aiInferences),
-    8
-  );
-
-  const bulletPoints = limitArray(
-    cleanStringArray(explanationRaw.bulletPoints),
-    8
-  );
-
-  const summary = cleanString(
-    explanationRaw.summary,
-    'The analysis is based on the journal entry provided by the user.'
-  );
-
-  const explanation = {
-    summary,
-    explicitMentions,
-    aiInferences,
-    bulletPoints
-  };
-
-  const aiResponse = cleanString(
-    safeRaw.aiResponse,
-    lang === 'ta'
-      ? 'உங்கள் பதிவில் வெளிப்பட்ட உணர்வுகளை கவனிப்பது பயனுள்ளதாக இருக்கலாம்.'
-      : 'Your journal gives you an opportunity to notice and reflect on what you are experiencing.'
-  );
-
-  const followUpQuestion = cleanString(
-    safeRaw.followUpQuestion,
-    lang === 'ta'
-      ? 'இந்த பதிவில் உங்களுக்கு மிகவும் முக்கியமாக தோன்றிய விஷயம் என்ன?'
-      : 'What part of this experience feels most important to you right now?'
-  );
-
-  const contributingFactors = limitArray(
-    cleanStringArray(safeRaw.contributingFactors),
-    8
-  );
-
-  const isCrisisDetected =
-    safetyRaw.isCrisisDetected === true;
-
-  const calmMessage = cleanString(
-    safetyRaw.calmMessage,
-    ''
-  );
-
-  const resources = limitArray(
-    cleanStringArray(safetyRaw.resources),
-    8
-  );
-
-  const safeRawText = rawText.trim();
-
-  if (!safeRawText) {
-    throw new Error('Journal text is empty.');
-  }
-
-  return {
-    mood,
-    emotion,
-    sentiment,
-    moodScore,
-    confidence,
-    contexts,
-    keywords,
-    triggers,
-    explanation,
-    aiResponse,
-    followUpQuestion,
-    contributingFactors,
-    suggestions,
-    safetyCheck: {
-      isCrisisDetected,
-      ...(calmMessage ? { calmMessage } : {}),
-      ...(resources.length > 0 ? { resources } : {})
-    }
-  } as AIAnalysisResult;
-}
-
-/* ============================================================
-   ANALYSIS PROMPT
-   ============================================================ */
-
-function buildAnalysisPrompt(
+  value: any,
   preprocessed: PreprocessedJournal,
   rawText: string,
   lang: SupportedLanguage
-): string {
-  const language = languageNames[lang] || 'English';
+): AIAnalysisResult {
+  const fallback = runMockAnalysis(
+    preprocessed,
+    rawText,
+    lang
+  );
 
-  const keywords = preprocessed.keywords
-    .filter(Boolean)
-    .slice(0, 20)
-    .join(', ');
+  return {
+    ...fallback,
+    ...value,
 
-  const sentences = preprocessed.sentences
-    .filter(Boolean)
-    .slice(0, 20);
+    mood:
+      typeof value?.mood === 'string'
+        ? value.mood
+        : fallback.mood,
 
-  return `
-You are the journal-analysis engine for Mood Journal AI.
+    emotion:
+      typeof value?.emotion === 'string'
+        ? value.emotion
+        : fallback.emotion,
 
-Your task is to analyze ONLY the journal text supplied below.
+    sentiment:
+      typeof value?.sentiment === 'string'
+        ? value.sentiment
+        : fallback.sentiment,
 
-The most important rule is:
+    moodScore:
+      Number.isFinite(Number(value?.moodScore))
+        ? Math.min(
+            5,
+            Math.max(1, Number(value.moodScore))
+          )
+        : fallback.moodScore,
 
-DO NOT invent facts.
+    confidence:
+      Number.isFinite(Number(value?.confidence))
+        ? Math.min(
+            0.99,
+            Math.max(0.5, Number(value.confidence))
+          )
+        : fallback.confidence,
 
-Every conclusion must be grounded in the actual journal text.
+    contexts:
+      Array.isArray(value?.contexts)
+        ? value.contexts.map(String)
+        : fallback.contexts,
 
-============================================================
-USER JOURNAL
-============================================================
+    keywords:
+      Array.isArray(value?.keywords)
+        ? value.keywords.map(String)
+        : fallback.keywords,
 
-"""
-${rawText.trim()}
-"""
+    triggers:
+      Array.isArray(value?.triggers)
+        ? value.triggers.map(String)
+        : fallback.triggers,
 
-============================================================
-PREPROCESSING INFORMATION
-============================================================
+    explanation:
+      value?.explanation &&
+      typeof value.explanation === 'object'
+        ? value.explanation
+        : fallback.explanation,
 
-Keywords extracted from the journal:
-${keywords || 'None'}
+    aiResponse:
+      typeof value?.aiResponse === 'string'
+        ? value.aiResponse
+        : fallback.aiResponse,
 
-Sentence count:
-${sentences.length}
+    followUpQuestion:
+      typeof value?.followUpQuestion === 'string'
+        ? value.followUpQuestion
+        : fallback.followUpQuestion,
 
-Detected sentences:
-${
-  sentences.length > 0
-    ? sentences.map((s, i) => `${i + 1}. ${s}`).join('\n')
-    : 'None'
+    contributingFactors:
+      Array.isArray(value?.contributingFactors)
+        ? value.contributingFactors.map(String)
+        : fallback.contributingFactors,
+
+    suggestions:
+      Array.isArray(value?.suggestions)
+        ? value.suggestions
+            .filter(
+              (item: any) =>
+                item &&
+                typeof item === 'object'
+            )
+            .map((item: any) => ({
+              title: String(item.title || ''),
+              description: String(
+                item.description || ''
+              ),
+              category: String(
+                item.category || 'General'
+              )
+            }))
+        : fallback.suggestions,
+
+    safetyCheck:
+      value?.safetyCheck &&
+      typeof value.safetyCheck === 'object'
+        ? {
+            isCrisisDetected:
+              value.safetyCheck
+                .isCrisisDetected === true,
+
+            calmMessage: String(
+              value.safetyCheck.calmMessage || ''
+            ),
+
+            resources:
+              Array.isArray(
+                value.safetyCheck.resources
+              )
+                ? value.safetyCheck.resources.map(
+                    String
+                  )
+                : []
+          }
+        : fallback.safetyCheck
+  } as AIAnalysisResult;
 }
 
-============================================================
-ANALYSIS RULES
-============================================================
-
-1. ANALYZE THE ACTUAL JOURNAL
-
-Read the complete journal carefully.
-
-Do not assume that a short journal means the person feels neutral.
-
-For example:
-
-"I am extremely stressed about tomorrow's presentation"
-
-must not be classified as "Neutral" simply because the journal is short.
-
-Likewise:
-
-"I went shopping with my friends and had a wonderful time"
-
-should not automatically receive a stress-related analysis.
-
-2. MOOD
-
-Choose the mood that best represents the emotional tone explicitly supported by the text.
-
-Examples:
-
-- Happy
-- Calm
-- Excited
-- Proud
-- Grateful
-- Relaxed
-- Stressed
-- Worried
-- Frustrated
-- Sad
-- Lonely
-- Angry
-- Overwhelmed
-- Mixed
-- Neutral
-
-Use "Neutral" ONLY when the journal genuinely does not provide enough emotional evidence.
-
-3. EMOTION
-
-Identify the most relevant emotion supported by the journal.
-
-Do not choose an emotion simply because it is common in student journals.
-
-4. SENTIMENT
-
-Use:
-
-- Positive
-- Negative
-- Neutral
-- Mixed
-
-Base this on the actual wording and meaning of the journal.
-
-5. MOOD SCORE
-
-Use a 1–5 scale:
-
-1 = very difficult / strongly negative
-2 = somewhat difficult / negative
-3 = neutral or mixed
-4 = generally positive
-5 = strongly positive / very good
-
-The score must reflect the journal.
-
-Do not automatically use 3.
-
-6. CONTEXTS
-
-Only include contexts that are actually mentioned or strongly supported.
-
-Possible contexts include:
-
-- Studies
-- Exams
-- Assignments
-- Project
-- Work
-- Friends
-- Family
-- Relationships
-- Health
-- Sleep
-- Money
-- Travel
-- Social activities
-- Daily routine
-- Personal growth
-- Hobbies
-- Future plans
-
-If a context is not supported by the journal, DO NOT include it.
-
-7. TRIGGERS
-
-Only identify triggers that the user actually describes.
-
-Do not invent:
-
-- exams
-- deadlines
-- sleep problems
-- family problems
-- relationship problems
-- workload
-- financial problems
-
-unless the journal supports them.
-
-If there is no clear trigger, return an empty array.
-
-8. KEYWORDS
-
-Use meaningful words or short phrases from the journal itself.
-
-Do not fill the keyword list with generic mental-health terms.
-
-9. EXPLANATION
-
-The explanation MUST clearly separate:
-
-A. explicitMentions
-
-Things the user actually stated.
-
-B. aiInferences
-
-Reasonable interpretations derived from the text.
-
-These MUST be labeled as interpretations, not facts.
-
-C. bulletPoints
-
-Give concise evidence-based points explaining the analysis.
-
-10. SUMMARY
-
-The summary should describe what the journal communicates.
-
-Do not use generic filler unless the actual journal supports that interpretation.
-
-11. AI RESPONSE
-
-Respond specifically to what the user wrote.
-
-Do not give the same wellness message for every journal.
-
-12. FOLLOW-UP QUESTION
-
-Ask one natural question that is relevant to the journal.
-
-13. CONTRIBUTING FACTORS
-
-Only list factors supported by the journal.
-
-14. SUGGESTIONS
-
-Suggestions must be relevant to the journal.
-
-Do not automatically recommend sleep, mindfulness, or exercise unless they make sense for the actual situation.
-
-15. SAFETY
-
-Check the journal for possible self-harm, suicide, immediate danger, or crisis language.
-
-Do not diagnose.
-
-If there is no such indication:
-
-isCrisisDetected = false
-
-If there is a genuine indication:
-
-isCrisisDetected = true
-
-and provide a calm, supportive safety message and appropriate emergency/crisis resources.
-
-16. NO DIAGNOSIS
-
-Never diagnose depression, anxiety disorder, PTSD, bipolar disorder, ADHD, or any other mental-health condition.
-
-You may describe emotions and observable language patterns.
-
-17. LANGUAGE
-
-All human-readable output must be written in:
-
-${language}
-
-Supported language code:
-${lang}
-
-18. CONFIDENCE
-
-Confidence should represent how strongly the actual journal supports the interpretation.
-
-Short or ambiguous journals should have lower confidence.
-
-19. IMPORTANT SHORT-ENTRY RULE
-
-A short journal is NOT automatically neutral.
-
-Examples:
-
-"Today was amazing!"
-=> Positive / Happy / high mood score
-
-"I am terrified about tomorrow."
-=> Negative / Fear or Worry / low mood score
-
-"I hate how everything went today."
-=> Negative / Frustration or Anger
-
-"Had lunch with my friends."
-=> Neutral unless the text contains emotional information
-
-"Finished my project! I am so proud."
-=> Positive / Pride
-
-20. OUTPUT
-
-Return ONLY valid JSON matching the requested schema.
-Do not include markdown.
-Do not include explanations outside the JSON.
-`;
-}
-
-/* ============================================================
-   RUN JOURNAL ANALYSIS
-   ============================================================ */
-
+/**
+ * ---------------------------------------------------------
+ * JOURNAL ANALYSIS
+ * ---------------------------------------------------------
+ */
 export async function runLLMAnalysis(
   preprocessed: PreprocessedJournal,
   rawText: string,
   lang: SupportedLanguage = 'en'
 ): Promise<AIAnalysisResult> {
-  const journalText = rawText?.trim();
-
-  if (!journalText) {
-    throw new Error('Journal text cannot be empty.');
-  }
-
   const client = getClient();
 
-  const prompt = buildAnalysisPrompt(
-    preprocessed,
-    journalText,
-    lang
-  );
-
-  /*
-   * Journal analysis model.
-   *
-   * This can be configured separately from the chatbot.
+  /**
+   * If Gemini is not configured, immediately use local analysis.
    */
-  const model =
-    process.env.GEMINI_MODEL?.trim() ||
-    'gemini-3.5-flash-lite';
+  if (!client) {
+    console.warn(
+      '⚠️ Gemini is not configured. Using local journal analysis fallback.'
+    );
 
-  const responseSchema = {
-    type: Type.OBJECT,
+    return runMockAnalysis(
+      preprocessed,
+      rawText,
+      lang
+    );
+  }
 
-    properties: {
-      mood: {
-        type: Type.STRING,
-        description:
-          'The emotional mood actually supported by the journal.'
-      },
+  if (!rawText || !rawText.trim()) {
+    console.warn(
+      '⚠️ Empty journal received. Using local analysis fallback.'
+    );
 
-      emotion: {
-        type: Type.STRING,
-        description:
-          'The primary emotion supported by the journal.'
-      },
+    return runMockAnalysis(
+      preprocessed,
+      rawText,
+      lang
+    );
+  }
 
-      sentiment: {
-        type: Type.STRING,
-        description:
-          'Positive, Negative, Neutral, or Mixed.'
-      },
-
-      moodScore: {
-        type: Type.INTEGER,
-        description:
-          'A journal-grounded score from 1 to 5.'
-      },
-
-      confidence: {
-        type: Type.NUMBER,
-        description:
-          'Confidence from 0 to 1 based on evidence in the journal.'
-      },
-
-      contexts: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.STRING
-        },
-        description:
-          'Only contexts supported by the journal.'
-      },
-
-      keywords: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.STRING
-        },
-        description:
-          'Important words or phrases grounded in the journal.'
-      },
-
-      triggers: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.STRING
-        },
-        description:
-          'Only explicitly stated or strongly supported triggers.'
-      },
-
-      explanation: {
-        type: Type.OBJECT,
-
-        properties: {
-          summary: {
-            type: Type.STRING
-          },
-
-          explicitMentions: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.STRING
-            }
-          },
-
-          aiInferences: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.STRING
-            }
-          },
-
-          bulletPoints: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.STRING
-            }
-          }
-        },
-
-        required: [
-          'summary',
-          'explicitMentions',
-          'aiInferences',
-          'bulletPoints'
-        ]
-      },
-
-      aiResponse: {
-        type: Type.STRING,
-        description:
-          'A personalized and compassionate reflection based specifically on the journal.'
-      },
-
-      followUpQuestion: {
-        type: Type.STRING,
-        description:
-          'One relevant follow-up question.'
-      },
-
-      contributingFactors: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.STRING
-        }
-      },
-
-      suggestions: {
-        type: Type.ARRAY,
-
-        items: {
-          type: Type.OBJECT,
-
-          properties: {
-            title: {
-              type: Type.STRING
-            },
-
-            description: {
-              type: Type.STRING
-            },
-
-            category: {
-              type: Type.STRING
-            }
-          },
-
-          required: [
-            'title',
-            'description',
-            'category'
-          ]
-        }
-      },
-
-      safetyCheck: {
-        type: Type.OBJECT,
-
-        properties: {
-          isCrisisDetected: {
-            type: Type.BOOLEAN
-          },
-
-          calmMessage: {
-            type: Type.STRING
-          },
-
-          resources: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.STRING
-            }
-          }
-        },
-
-        required: [
-          'isCrisisDetected'
-        ]
-      }
-    },
-
-    required: [
-      'mood',
-      'emotion',
-      'sentiment',
-      'moodScore',
-      'confidence',
-      'contexts',
-      'keywords',
-      'triggers',
-      'explanation',
-      'aiResponse',
-      'followUpQuestion',
-      'contributingFactors',
-      'suggestions',
-      'safetyCheck'
-    ]
+  const languageNames: Record<
+    SupportedLanguage,
+    string
+  > = {
+    en: 'English',
+    ta: 'Tamil',
+    hi: 'Hindi',
+    ml: 'Malayalam',
+    te: 'Telugu',
+    kn: 'Kannada',
+    ur: 'Urdu',
+    tanglish:
+      'natural Tanglish (Tamil-English mix written with English letters)'
   };
 
-  const maxAttempts = 3;
+  /**
+   * IMPORTANT:
+   * rawText is explicitly included here.
+   *
+   * This prevents the previous bug where "en" was accidentally
+   * sent to Gemini instead of the journal text.
+   */
+  const journalText = rawText.trim();
 
-  let lastError: unknown = null;
+  const prompt = `You are Mood Journal AI, an empathetic wellness reflection assistant.
 
-  for (
-    let attempt = 1;
-    attempt <= maxAttempts;
-    attempt++
-  ) {
-    try {
-      console.log(
-        `🧠 Gemini journal analysis attempt ${attempt}/${maxAttempts}`
-      );
+Analyze ONLY the journal entry provided below.
 
-      const apiCall =
-        client.models.generateContent({
-          model,
-          contents: prompt,
-
-          config: {
-            systemInstruction: `
-You are the analysis engine for Mood Journal AI.
-
-Your highest priority is factual grounding in the user's exact journal.
-
-Never invent details.
-
-Never assume that a short entry is neutral.
-
-Never use generic analysis when the journal contains specific emotional information.
-
-Separate explicit statements from AI inference.
-
+Do not analyze the language code.
+Do not analyze previous journals.
+Do not invent facts.
 Do not diagnose medical or mental-health conditions.
 
-Return only the requested JSON structure.
-`,
+Understand:
+- English
+- Tamil
+- Tanglish
+- Hindi
+- Telugu
+- Malayalam
+- Kannada
+- Urdu
+- mixed-language writing
 
-            responseMimeType: 'application/json',
+Return all human-readable fields in ${languageNames[lang]}.
 
-            responseSchema
-          }
-        });
+IMPORTANT:
+- Base the analysis directly on the user's journal.
+- Clearly distinguish what the user explicitly said from reasonable interpretation.
+- Do not exaggerate emotions.
+- Do not diagnose.
+- If the journal is short, still analyze the actual meaning.
+- Do not describe the journal as generic "daily thoughts" unless that is actually what it says.
 
-      const timeout = new Promise<never>(
-        (_, reject) => {
-          setTimeout(
-            () =>
-              reject(
-                new Error(
-                  'Gemini journal analysis timed out after 30000ms.'
-                )
-              ),
-            30000
-          );
-        }
+JOURNAL ENTRY:
+
+"""
+${journalText}
+"""
+
+Return ONLY valid JSON using exactly this structure:
+
+{
+  "mood": "Happy|Calm|Stressed|Low|Neutral|Mixed",
+  "emotion": "short emotion",
+  "sentiment": "Positive|Negative|Neutral|Mixed",
+  "moodScore": 1,
+  "confidence": 0.8,
+  "contexts": [],
+  "keywords": [],
+  "triggers": [],
+  "explanation": {
+    "summary": "",
+    "explicitMentions": [],
+    "aiInferences": [],
+    "bulletPoints": []
+  },
+  "aiResponse": "",
+  "followUpQuestion": "",
+  "contributingFactors": [],
+  "suggestions": [
+    {
+      "title": "",
+      "description": "",
+      "category": ""
+    }
+  ],
+  "safetyCheck": {
+    "isCrisisDetected": false,
+    "calmMessage": "",
+    "resources": []
+  }
+}
+
+Rules:
+- moodScore must be between 1 and 5.
+- confidence must be between 0.50 and 0.99.
+- contexts, keywords, triggers, contributingFactors and resources must be arrays.
+- If there is no evidence of crisis, isCrisisDetected must be false.
+- Do not invent crisis information.
+- Keep suggestions practical and relevant to the actual journal.
+- The aiResponse must directly acknowledge the user's journal.
+- The followUpQuestion should be useful and gentle.
+`;
+
+  console.log(
+    `📝 Gemini received journal: ${JSON.stringify(journalText)}`
+  );
+
+  console.log(
+    `🧠 Gemini journal analysis model: ${JOURNAL_MODEL}`
+  );
+
+  let lastError: any = null;
+
+  /**
+   * Only retry genuine temporary server/model errors.
+   *
+   * We DO NOT retry 429 quota errors.
+   */
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      console.log(
+        `🧠 Gemini journal analysis attempt ${attempt}/2`
       );
 
       const response: any =
         await Promise.race([
-          apiCall,
-          timeout
+          client.models.generateContent({
+            model: JOURNAL_MODEL,
+            contents: prompt,
+
+            config: {
+              systemInstruction:
+                'Return compact valid JSON only. Be empathetic, factual, specific to the journal, and non-diagnostic.',
+
+              responseMimeType:
+                'application/json',
+
+              temperature: 0.4,
+
+              /**
+               * Increased from 900 to prevent
+               * "Unterminated string in JSON" errors.
+               */
+              maxOutputTokens: 1800
+            }
+          }),
+
+          new Promise<never>((_, reject) => {
+            setTimeout(
+              () =>
+                reject(
+                  new Error(
+                    'Gemini journal analysis timed out after 20000ms.'
+                  )
+                ),
+              20000
+            );
+          })
         ]);
 
-      const parsedText =
-        response?.text?.trim();
+      const responseText = String(
+        response?.text || ''
+      ).trim();
 
-      if (!parsedText) {
+      if (!responseText) {
         throw new Error(
-          'Gemini returned an empty journal analysis.'
+          'Gemini returned an empty journal analysis response.'
         );
       }
 
-      let parsed: any;
-
-      try {
-        parsed = JSON.parse(parsedText);
-      } catch {
-        console.error(
-          'Gemini returned invalid JSON:',
-          parsedText
-        );
-
-        throw new Error(
-          'Gemini returned invalid JSON for journal analysis.'
-        );
-      }
-
-      const normalized =
-        normalizeAnalysis(
-          parsed,
-          journalText,
-          lang
-        );
-
-      console.log(
-        `✅ Gemini journal analysis completed successfully. Mood: ${normalized.mood}, Emotion: ${normalized.emotion}, Score: ${normalized.moodScore}`
+      const cleaned = cleanJson(
+        responseText
       );
 
-      return normalized;
-    } catch (err: any) {
-      lastError = err;
+      const parsed = JSON.parse(cleaned);
 
-      const message =
-        err?.message ||
-        String(err);
+      console.log(
+        '✅ Gemini journal analysis response received.'
+      );
+
+      return normalizeAnalysis(
+        parsed,
+        preprocessed,
+        journalText,
+        lang
+      );
+    } catch (error: any) {
+      lastError = error;
 
       console.error(
         `❌ Gemini journal analysis attempt ${attempt} failed:`,
-        message
+        error?.message || error
       );
 
-      const status =
-        err?.status ||
-        err?.error?.code;
+      /**
+       * QUOTA ERROR
+       *
+       * Immediately use the local fallback.
+       */
+      if (isQuotaError(error)) {
+        console.warn(
+          '⚠️ Gemini quota is exhausted. Using local journal analysis fallback.'
+        );
 
-      const isTemporary =
-        status === 429 ||
-        status === 500 ||
-        status === 502 ||
-        status === 503 ||
-        status === 504 ||
-        message.includes('429') ||
-        message.includes('500') ||
-        message.includes('502') ||
-        message.includes('503') ||
-        message.includes('504') ||
-        message.toLowerCase().includes('high demand') ||
-        message.toLowerCase().includes('temporarily unavailable');
+        return runMockAnalysis(
+          preprocessed,
+          journalText,
+          lang
+        );
+      }
 
+      /**
+       * Do not retry non-temporary errors.
+       */
       if (
-        !isTemporary ||
-        attempt === maxAttempts
+        !isRetryableGeminiError(error) ||
+        attempt === 2
       ) {
         break;
       }
 
-      const delay =
-        attempt === 1
-          ? 1500
-          : attempt === 2
-            ? 3000
-            : 5000;
-
       console.log(
-        `⏳ Gemini temporarily unavailable. Retrying in ${delay}ms...`
+        '⏳ Gemini temporarily unavailable. Retrying in 4000ms...'
       );
 
       await new Promise((resolve) =>
-        setTimeout(resolve, delay)
+        setTimeout(resolve, 4000)
       );
     }
   }
 
-  throw new Error(
-    `Gemini journal analysis failed after ${maxAttempts} attempts: ${
-      lastError instanceof Error
-        ? lastError.message
-        : String(lastError)
-    }`
+  /**
+   * Genuine temporary Gemini failure.
+   * Use local analysis instead of breaking the Journal page.
+   */
+  if (isRetryableGeminiError(lastError)) {
+    console.warn(
+      '⚠️ Gemini is temporarily unavailable. Using local journal analysis fallback.'
+    );
+
+    return runMockAnalysis(
+      preprocessed,
+      journalText,
+      lang
+    );
+  }
+
+  /**
+   * Any other Gemini failure also falls back locally.
+   *
+   * This means the Journal page remains usable even if
+   * Gemini returns an unexpected error.
+   */
+  console.warn(
+    '⚠️ Gemini journal analysis failed. Using local journal analysis fallback.'
+  );
+
+  return runMockAnalysis(
+    preprocessed,
+    journalText,
+    lang
   );
 }
 
-/* ============================================================
-   GEMINI CHATBOT
-   ============================================================ */
+/**
+ * ---------------------------------------------------------
+ * CHATBOT
+ * ---------------------------------------------------------
+ */
+
+function getLocalChatbotFallback(
+  userMessage: string,
+  latestJournalSummary: string | undefined,
+  lang: SupportedLanguage
+): string {
+  const message =
+    userMessage.trim();
+
+  const journal =
+    latestJournalSummary?.trim();
+
+  const languageName: Record<
+    SupportedLanguage,
+    string
+  > = {
+    en: 'English',
+    ta: 'Tamil',
+    hi: 'Hindi',
+    ml: 'Malayalam',
+    te: 'Telugu',
+    kn: 'Kannada',
+    ur: 'Urdu',
+    tanglish:
+      'natural Tanglish'
+  };
+
+  if (lang === 'ta') {
+    return `நான் இப்போது AI சேவையை அணுக முடியாத நிலையில் இருக்கிறேன். ஆனால் நீங்கள் பகிர்ந்த "${message}" என்பதை கவனமாக எடுத்துக்கொள்கிறேன். சிறிது நேரம் கழித்து மீண்டும் முயற்சி செய்யலாம்.`;
+  }
+
+  if (lang === 'tanglish') {
+    return `Ippo AI service temporarily unavailable. Neenga sonna "${message}" important-aa irukku. Konjam later again try pannunga.`;
+  }
+
+  if (lang === 'hi') {
+    return `अभी AI सेवा अस्थायी रूप से उपलब्ध नहीं है। आपने जो कहा है — "${message}" — उसे मैं ध्यान में रख रहा हूँ। थोड़ी देर बाद फिर कोशिश करें।`;
+  }
+
+  /**
+   * English default.
+   *
+   * We mention the latest journal only when available.
+   */
+  if (journal) {
+    return `I’m temporarily unable to reach Gemini right now, but I’m still here with you. Based on your current message, "${message}", and your recent journal context, it may help to take things one step at a time. Please try the AI conversation again in a little while.`;
+  }
+
+  return `I’m temporarily unable to reach Gemini right now, but I’m still here with you. I’ve received your message: "${message}". Please try the AI conversation again in a little while.`;
+}
 
 export async function runChatbotResponse(
   userMessage: string,
@@ -956,340 +613,172 @@ export async function runChatbotResponse(
   latestJournalSummary?: string,
   lang: SupportedLanguage = 'en'
 ): Promise<string> {
-  const message = userMessage?.trim();
+  const client = getClient();
 
-  if (!message) {
-    throw new Error(
-      'Chatbot message cannot be empty.'
+  /**
+   * If Gemini is not configured, use local fallback.
+   */
+  if (!client) {
+    console.warn(
+      '⚠️ Gemini is not configured. Using local chatbot fallback.'
+    );
+
+    return getLocalChatbotFallback(
+      userMessage,
+      latestJournalSummary,
+      lang
     );
   }
 
-  const client = getClient();
+  const languageName: Record<
+    SupportedLanguage,
+    string
+  > = {
+    en: 'English',
+    ta: 'Tamil',
+    hi: 'Hindi',
+    ml: 'Malayalam',
+    te: 'Telugu',
+    kn: 'Kannada',
+    ur: 'Urdu',
+    tanglish:
+      'natural Tanglish (Tamil-English mix written using English letters)'
+  };
 
-  const language =
-    languageNames[lang] || 'English';
-
-  /*
-   * Keep a useful amount of conversation history.
-   *
-   * We intentionally do not send unlimited history because
-   * that can make the chatbot slower and unnecessarily large.
-   */
   const recentHistory = history
     .filter(
-      (item) =>
-        (item.role === 'user' ||
-          item.role === 'model') &&
-        typeof item.text === 'string' &&
-        item.text.trim().length > 0
+      (message) =>
+        (
+          message.role === 'user' ||
+          message.role === 'model'
+        ) &&
+        typeof message.text === 'string' &&
+        message.text.trim().length > 0
     )
     .slice(-20)
-    .map((item) => ({
-      role: item.role,
+    .map((message) => ({
+      role: message.role,
       parts: [
         {
-          text: item.text.trim()
+          text: message.text.trim()
         }
       ]
     }));
 
   const journalContext =
     latestJournalSummary?.trim() ||
-    'No saved journal summary is available.';
+    'No saved journal entries are available yet.';
 
-  /*
-   * IMPORTANT:
-   *
-   * The chatbot has its own instruction set.
-   *
-   * This is what makes it behave like a conversational assistant
-   * instead of simply returning a journal-analysis result.
-   */
-  const systemInstruction = `
-You are the conversational AI assistant inside Mood Journal AI.
+  const systemInstruction = `You are the conversational AI assistant inside Mood Journal AI.
 
-You are powered by Gemini.
+You are powered by Google Gemini.
 
-============================================================
-LANGUAGE
-============================================================
+LANGUAGE:
+Always answer in ${languageName[lang]}.
 
-Always answer in ${language}.
+If the user writes in English, respond naturally in English.
+If the user writes in Tamil, respond naturally in Tamil.
+If the user writes in Tanglish, respond naturally in Tanglish.
+Do not unnecessarily switch languages.
 
-If the user uses mixed language or natural Tanglish,
-understand the meaning and respond naturally in the same
-comfortable language style when appropriate.
+CONVERSATION:
+- Use the entire conversation history.
+- Remember what the user has already told you.
+- Understand follow-up messages.
+- Connect follow-up messages with previous messages.
+- Never ask the user to repeat information already available.
+- Do not treat every message as a completely new conversation.
+- Do not repeatedly say "You said".
+- Do not use canned or scripted responses.
+- Do not invent facts about the user.
 
-============================================================
-CONVERSATION MEMORY
-============================================================
+NATURAL CONVERSATION:
+- Respond directly to the user's actual message.
+- Be warm, empathetic and conversational.
+- Acknowledge emotions naturally.
+- Give practical suggestions when appropriate.
+- Ask at most one useful follow-up question when genuinely helpful.
+- Do not force every conversation back to journaling.
+- If the user asks a normal question, answer it normally.
 
-Use the complete recent conversation to understand the
-current message.
+MOOD JOURNAL:
+- Use saved journal context when relevant.
+- Discuss moods, emotions, journal entries, patterns and goals.
+- Clearly distinguish observations from assumptions.
+- Never diagnose medical or mental-health conditions.
 
-The conversation may contain short replies such as:
+SAFETY:
+- You are a wellness and self-reflection assistant.
+- You are not a doctor or therapist.
+- Never diagnose a mental-health or medical condition.
+- If the user describes immediate danger or an emergency, encourage them to contact local emergency services or a trusted person who can help immediately.
 
-- yes
-- yeah
-- no
-- because...
-- same
-- okay
-- then?
-- why?
-- what about that?
-- tell me more
-- I don't know
+STYLE:
+- Warm.
+- Natural.
+- Conversational.
+- Specific to the user's message.
+- Usually 2-5 sentences.
+- Avoid repetitive sentence structures.
+- Respond directly before asking a question.
 
-These must be understood using the previous conversation.
+SAVED JOURNAL CONTEXT:
+${journalContext}`;
 
-Do NOT treat every message as a completely new conversation.
-
-Do NOT ask the user to repeat information that already exists
-in the conversation.
-
-============================================================
-PERSONAL INFORMATION
-============================================================
-
-Do not invent personal information.
-
-Only use personal information that appears in:
-
-1. The current conversation
-2. The recent conversation history
-3. The provided journal context
-
-Do not claim to remember something that was never provided.
-
-============================================================
-LATEST JOURNAL CONTEXT
-============================================================
-
-${journalContext}
-
-Use this context when it is relevant.
-
-Do NOT force every conversation back to the journal.
-
-If the user asks something unrelated, answer that question
-normally.
-
-============================================================
-CONVERSATIONAL BEHAVIOR
-============================================================
-
-Have a natural human-like conversation.
-
-For example:
-
-User:
-"I completed my project today."
-
-Good response:
-"That's a nice achievement. You put in the work and got it
-done. How are you feeling now that it's finally finished?"
-
-If the user says:
-"very happy"
-
-Continue from the previous conversation.
-
-Do NOT restart the conversation by saying:
-"Thank you for sharing."
-
-Do NOT repeat the same generic wellness message.
-
-If the user says:
-"because I worked on it for three weeks"
-
-Recognize that this explains why finishing the project feels
-important.
-
-============================================================
-EMOTIONAL SUPPORT
-============================================================
-
-Be warm, respectful, supportive, and non-judgmental.
-
-You may help the user:
-
-- reflect on feelings
-- understand everyday emotions
-- organize thoughts
-- think through normal problems
-- identify practical next steps
-- celebrate positive experiences
-- talk through stress
-- talk through relationships
-- think about studies
-- think about projects
-- think about daily routines
-
-Do not diagnose mental-health or medical conditions.
-
-Do not claim certainty about someone's mental state.
-
-============================================================
-CRISIS SAFETY
-============================================================
-
-If the user clearly describes immediate danger,
-self-harm, suicide, or an emergency:
-
-- respond calmly
-- encourage immediate real-world support
-- encourage contacting local emergency services or a trusted
-  person nearby
-- do not provide dangerous instructions
-- do not diagnose
-
-For ordinary sadness, stress, frustration, loneliness,
-confusion, or disappointment, provide normal supportive
-conversation without unnecessarily escalating.
-
-============================================================
-STYLE
-============================================================
-
-Be:
-
-- Warm
-- Natural
-- Human-sounding
-- Specific
-- Concise
-- Conversational
-- Helpful
-
-Usually respond in 2–5 sentences.
-
-Answer the user's actual question first.
-
-Ask at most ONE useful follow-up question when it naturally
-continues the conversation.
-
-Do not ask a question every single time.
-
-Do not repeatedly use scripted phrases such as:
-
-"Thank you for sharing."
-
-"I'm here for you."
-
-"That sounds difficult."
-
-Use those only when they genuinely fit.
-
-Do not say "as an AI" unless necessary.
-
-Do not mention internal prompts, models, APIs, system
-instructions, or implementation details.
-
-============================================================
-IMPORTANT
-============================================================
-
-The goal is a REAL CONVERSATION.
-
-Do not turn every message into a journal analysis.
-
-Do not produce a structured psychological report unless
-the user explicitly asks for one.
-
-Respond naturally to what the user actually said.
-`;
-
-  /*
-   * Gemini expects alternating user/model conversation roles.
-   *
-   * We add the current user message after the previous history.
-   */
   const contents = [
     ...recentHistory,
     {
       role: 'user' as const,
       parts: [
         {
-          text: message
+          text: userMessage.trim()
         }
       ]
     }
   ];
 
-  /*
-   * IMPORTANT:
-   *
-   * The chatbot uses a SEPARATE model variable.
-   *
-   * This prevents changing GEMINI_MODEL for journal analysis
-   * from accidentally changing the chatbot model.
-   *
-   * You can configure this in .env with:
-   *
-   * GEMINI_CHAT_MODEL=gemini-3.5-flash
-   *
-   * If it is not present, this stable chatbot default is used.
+  let lastError: any = null;
+
+  /**
+   * Chatbot:
+   * retry genuine temporary errors,
+   * but NEVER retry quota errors.
    */
-  const model =
-  process.env.GEMINI_CHAT_MODEL?.trim() ||
-  'gemini-3.6-flash';
-
-  console.log(
-    `🤖 Gemini chatbot model: ${model}`
-  );
-
-  const maxAttempts = 3;
-
-  let lastError: unknown = null;
-
-  for (
-    let attempt = 1;
-    attempt <= maxAttempts;
-    attempt++
-  ) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       console.log(
-        `💬 Gemini chatbot attempt ${attempt}/${maxAttempts}`
-      );
-
-      const apiCall =
-        client.models.generateContent({
-          model,
-
-          contents,
-
-          config: {
-            systemInstruction,
-
-            temperature: 0.75,
-
-            maxOutputTokens: 500
-          }
-        });
-
-      const timeout = new Promise<never>(
-        (_, reject) => {
-          setTimeout(
-            () =>
-              reject(
-                new Error(
-                  'Gemini chatbot call timed out after 30000ms.'
-                )
-              ),
-            30000
-          );
-        }
+        `🤖 Gemini chatbot attempt ${attempt}/2 using ${CHAT_MODEL}...`
       );
 
       const response: any =
         await Promise.race([
-          apiCall,
-          timeout
+          client.models.generateContent({
+            model: CHAT_MODEL,
+            contents,
+
+            config: {
+              systemInstruction,
+              temperature: 0.8,
+              maxOutputTokens: 500
+            }
+          }),
+
+          new Promise<never>((_, reject) => {
+            setTimeout(
+              () =>
+                reject(
+                  new Error(
+                    'Gemini chatbot timed out after 30000ms.'
+                  )
+                ),
+              30000
+            );
+          })
         ]);
 
-      const answer =
-        response?.text?.trim();
+      const answer = String(
+        response?.text || ''
+      ).trim();
 
       if (!answer) {
         throw new Error(
@@ -1302,72 +791,60 @@ Respond naturally to what the user actually said.
       );
 
       return answer;
-    } catch (err: any) {
-      lastError = err;
-
-      const errorMessage =
-        err?.message ||
-        String(err);
+    } catch (error: any) {
+      lastError = error;
 
       console.error(
         `❌ Gemini chatbot attempt ${attempt} failed:`,
-        errorMessage
+        error?.message || error
       );
 
-      const status =
-        err?.status ||
-        err?.error?.code;
+      /**
+       * QUOTA:
+       * Immediately use local fallback.
+       */
+      if (isQuotaError(error)) {
+        console.warn(
+          '⚠️ Gemini chatbot quota exhausted. Using local chatbot fallback.'
+        );
 
-      const isTemporary =
-        status === 429 ||
-        status === 500 ||
-        status === 502 ||
-        status === 503 ||
-        status === 504 ||
-        errorMessage.includes('429') ||
-        errorMessage.includes('500') ||
-        errorMessage.includes('502') ||
-        errorMessage.includes('503') ||
-        errorMessage.includes('504') ||
-        errorMessage
-          .toLowerCase()
-          .includes('high demand') ||
-        errorMessage
-          .toLowerCase()
-          .includes('temporarily unavailable') ||
-        errorMessage
-          .toLowerCase()
-          .includes('unavailable');
+        return getLocalChatbotFallback(
+          userMessage,
+          latestJournalSummary,
+          lang
+        );
+      }
 
+      /**
+       * Don't retry permanent errors.
+       */
       if (
-        !isTemporary ||
-        attempt === maxAttempts
+        !isRetryableGeminiError(error) ||
+        attempt === 2
       ) {
         break;
       }
 
-      const delay =
-        attempt === 1
-          ? 1000
-          : attempt === 2
-            ? 2500
-            : 5000;
-
       console.log(
-        `⏳ Gemini temporarily unavailable. Retrying in ${delay}ms...`
+        '⏳ Gemini chatbot temporarily unavailable. Retrying in 3000ms...'
       );
 
       await new Promise((resolve) =>
-        setTimeout(resolve, delay)
+        setTimeout(resolve, 3000)
       );
     }
   }
 
-  throw new Error(
-    `Gemini chatbot failed after ${maxAttempts} attempts: ${
-      lastError instanceof Error
-        ? lastError.message
-        : String(lastError)
-    }`
+  /**
+   * Genuine temporary Gemini failure.
+   */
+  console.warn(
+    '⚠️ Gemini chatbot unavailable. Using local chatbot fallback.'
+  );
+
+  return getLocalChatbotFallback(
+    userMessage,
+    latestJournalSummary,
+    lang
   );
 }
